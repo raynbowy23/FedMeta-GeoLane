@@ -1,4 +1,4 @@
-# FedMeta-GeoLane: Federated Meta Learning Lane Detection in a Digital Twin Framework
+# Geo-ORBIT: A Federated Digital Twin Framework for Scene-Adaptive Lane Geometry Detection
 
 **Authors**: Rei Tamaru, Pei Li, Bin Ran  
 **Affiliation**: University of Wisconsin–Madison
