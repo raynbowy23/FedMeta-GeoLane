@@ -25,7 +25,7 @@ Geo-ORBIT is composed of three modular and interconnected processes:
   Detected lanes are synchronized with **SUMO** and **CARLA** to create a high-fidelity, real-time **Digital Twin** that supports traffic flow rendering and scenario replay.
 
 <figure style="text-align: center;">
-  <img src="figs/gooorbit.png" width="90%">
+  <img src="figs/geoorbit.png" width="90%">
   <figcaption><b>Figure:</b> Architecture of the federated meta-learning framework. The framework detects roadway geometry at local entities with local GeoLane models. The central server collects parameters from local entities with federated learning. The DT synchronizes road geometry and trajectories in a simulated environment.</figcaption>
 </figure>
 
