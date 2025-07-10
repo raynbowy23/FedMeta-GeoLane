@@ -1,0 +1,12 @@
+numpy==2.2.0
+pytz==2024.2
+opencv-python==4.10.0.84
+ultralytics==8.3.48
+utm==0.7.0
+pandas==2.2.3
+polars==0.16.8
+torch==2.5.1
+torchvision==0.20.1
+tqdm==4.65.0
+scikit-learn==1.6.1
+joblib==1.4.2

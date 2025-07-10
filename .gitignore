@@ -1,0 +1,11 @@
+**/__pycache__/
+
+yolo11n.pt
+dataset/
+runs/
+mlruns/
+results/*
+!results/*/preprocess
+
+logs/*.log
+*.zip

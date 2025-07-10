@@ -29,8 +29,42 @@ Geo-ORBIT is composed of three modular and interconnected processes:
   <figcaption><b>Figure:</b> Architecture of the federated meta-learning framework. The framework detects roadway geometry at local entities with local GeoLane models. The central server collects parameters from local entities with federated learning. The DT synchronizes road geometry and trajectories in a simulated environment.</figcaption>
 </figure>
 
+## Requirements
+Test environment
+
+- Ubuntu 22.04
+- GPU: RTX 3090
+- CUDA 12.4
+- Python 3.10.15
+- Pytorch 2.5.1
 
 
+### Installation
+Prepare SUMO, netconvert.
+
+Create conda environment with Python >= 3.10. 
+`conda create -n Python3.10`
+
+Run `pip install -r requirements.txt`.
+
+### Process
+From the project root directory, run followings.
+
+Change file name and file path as needed. Also, you can check if your conversion is correct in [OpenDDRIVE Viewer](https://odrviewer.io/).
+
+Make sure your Carla server is running before these steps. Check which carla is using in your codes and launch the corresponding server (e.g. `pip freeze | grep carla`).
+
+Using `--use_historical_data` in argument, you can use last time detection results (need to update that it should skip certain time to time). Also, `--skip_continuous_learning`, you can skip detection.
+
+Run `bash run.sh` for quick run.
+
+## Dataset Preparation
+
+Create dataset folder under this repository, which is consisted of '511calibration', '511video' folders, and camera_loaction_list.txt.
+
+Under 511calibration folder, make csv file.
+
+For your own custom data, please add mp4 video in 511video and add corresponding calibration file. Feel free to use our examples. Those preprocessed trajectory files are stored in results/511video/preprocess.
 
 ## FedMeta-GeoLane: Federated Meta-Learning Lane Detection
 
@@ -99,12 +133,6 @@ Geo-ORBIT connects real-world observations to virtual testbeds using a synchroni
 </figure>
 
 
-## Repository Contents (coming soon)
-
-- `geo_orbit/` – Main framework scripts for detection, simulation, and synchronization  
-- `fedmeta_geolane/` – Federated meta-learning modules and parameter optimization  
-- `configs/` – Task-specific scene and camera configuration  
-- `data/` – Example trajectory datasets and calibration files  
-- `eval/` – Metric computation: trajectory discrepancy, lane alignment, and communication cost  
-- `scripts/` – CLI tools for running detection, training, and visualization
-
+## TODO
+- Input data are fixed as we provide only 60 seconds for now. It is worthwhile to try the model with extending video length and temporal video data.
+- Integrate with config.yml

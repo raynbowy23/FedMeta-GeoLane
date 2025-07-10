@@ -1,0 +1,22 @@
+meta_model:
+  feature_dim: 5
+  hidden_dim: 128
+  num_theta_params: 5
+
+federated:
+  num_rounds: 100
+  clients_per_round_ratio: 0.8
+  client_sampling: 'importance' # or 'random', 'round_robin'
+
+training:
+  meta_epochs_per_round: 10
+  meta_learning_rate: 0.001
+  num_trials_per_client: 3
+
+privacy:
+  differential_privacy: false
+  noise_multiplier: 1.0
+
+communication:
+  compression: true
+  compression_ratio: 0.1

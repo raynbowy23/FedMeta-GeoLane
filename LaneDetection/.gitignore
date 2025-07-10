@@ -1,0 +1,10 @@
+/mlartifacts
+/mlruns
+test.ipynb
+mlflow_test.py
+__pycache__
+/osm_extraction/cache
+/trajectory_extraction/__pycache__
+/Multiple_ROI_lane_learning_system_for_Highway
+*.xodr
+*.xml
