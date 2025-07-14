@@ -1,14 +1,30 @@
-# Geo-ORBIT: A Federated Digital Twin Framework for Scene-Adaptive Lane Geometry Detection
+<div id="top" align="center">
+<p align="center">
+  <strong>
+    <h1 align="center">Geo-ORBIT</h1>
+    <!-- <h3 align="center"><a href="">Website</a> | <a href="#">Paper</a></h3> -->
+  </strong>
+</p>
+</div>
 
-**Authors**: Rei Tamaru, Pei Li, and Bin Ran  
-**Affiliation**: University of Wisconsin–Madison
+> Geo-ORBIT: A Federated Digital Twin Framework for Scene-Adaptive Lane Geometry Detection (Paper be uploaded)
+>
+> **Authors**: [Rei Tamaru](https://tamaru.com), [Pei Li](https://scholar.google.com/citations?user=0QzhzL0AAAAJ), and [Bin Ran](https://scholar.google.com/citations?user=Kg5OoCUAAAAJ)
+>
+> **Affiliation**: University of Wisconsin–Madison
 
-
-## Overview
+---
 
 **Geo-ORBIT** (Geometrical Operational Roadway Blueprint with Integrated Twin) is a unified framework that integrates real-time lane detection, federated learning, and digital twin synchronization. It is designed to support active traffic management, infrastructure monitoring, and real-time scenario testing without relying on centralized data collection.
 
 At the core of Geo-ORBIT is **FedMeta-GeoLane**, a federated meta-learning-based lane detection model that adapts to scene-specific geometry using only vehicle trajectory data. By preserving privacy and reducing bandwidth, this system enables scalable deployment across diverse roadside camera environments.
+
+<figure style="text-align: center;">
+  <img src="figs/qualitative_result.png" width="100%">
+  <figcaption><b>Figure:</b> Qualitative comparison across multiple locations. The camera at Park is treated as an unseen location for Meta-GeoLane and FedMeta-GeoLane. Blue lines represent trajectory contours, and each lane is colored accordingly in the same lane group.</figcaption>
+</figure>
+  <!-- <figcaption><b>Figure:</b> Architecture of the federated meta-learning framework. The framework detects roadway geometry at local entities with local GeoLane models. The central server collects parameters from local entities with federated learning. The DT synchronizes road geometry and trajectories in a simulated environment.</figcaption> -->
+
 
 
 ## System Architecture
@@ -24,47 +40,148 @@ Geo-ORBIT is composed of three modular and interconnected processes:
 - **Simulation Process**  
   Detected lanes are synchronized with **SUMO** and **CARLA** to create a high-fidelity, real-time **Digital Twin** that supports traffic flow rendering and scenario replay.
 
-<figure style="text-align: center;">
-  <img src="figs/geoorbit.png" width="90%">
-  <figcaption><b>Figure:</b> Architecture of the federated meta-learning framework. The framework detects roadway geometry at local entities with local GeoLane models. The central server collects parameters from local entities with federated learning. The DT synchronizes road geometry and trajectories in a simulated environment.</figcaption>
-</figure>
+## Installation
+Geo-ORBIT works with Python 3.10+ and Pytorch 2.5.1+.
 
-## Requirements
-Test environment
-
-- Ubuntu 22.04
-- GPU: RTX 3090
-- CUDA 12.4
-- Python 3.10.15
-- Pytorch 2.5.1
-
-
-### Installation
-Prepare SUMO, netconvert.
+Clone the repository
+```bash
+git clone https://github.com/raynbowy23/FedMeta-GeoLane.git
+cd FedMeta-GeoLane
+```
 
 Create conda environment with Python >= 3.10. 
-`conda create -n Python3.10`
+```bash
+conda create -n lane_detection Python3.10
+conda activate lane_detection
+```
 
-Run `pip install -r requirements.txt`.
+Install dependencies
+```bash
+pip install -r requirements.txt
+```
 
-### Process
-From the project root directory, run followings.
+Set up SUMO
+```bash
+sudo apt-get install sumo sumo-tools sumo-doc
+export SUMO_HOME="/usr/share/sumo"
+```
 
-Change file name and file path as needed. Also, you can check if your conversion is correct in [OpenDDRIVE Viewer](https://odrviewer.io/).
+Prepare data directories
+```bash
+mkdir -p dataset/511video dataset/511calibration
+mkdir -p results logs
+```
 
-Make sure your Carla server is running before these steps. Check which carla is using in your codes and launch the corresponding server (e.g. `pip freeze | grep carla`).
+## How to Use
+### Quickstart
 
-Using `--use_historical_data` in argument, you can use last time detection results (need to update that it should skip certain time to time). Also, `--skip_continuous_learning`, you can skip detection.
+Run the complete federated learning pipeline:
+```bash
+bash run.sh
+```
+This executes the defualt configuration with federated meta-learning on historical data.
 
-Run `bash run.sh` for quick run.
+### Basic Usage
+1. Prepare camera calibration data.
+- Place GPS calibration points in `dataset/511calibration`.
+- Format: `camera_name.csv` with columns: `pixel_x, pixel_y, latitude, longitude`.
 
-## Dataset Preparation
+2. Add camera locations
+- List camera names in `dataset/camera_location_list.txt`.
+- One camera name per line.
 
-Create dataset folder under this repository, which is consisted of '511calibration', '511video' folders, and camera_loaction_list.txt.
+3. Map Data Selection
+- Extract corresponding OpenStreetMap data using `python osmWebWizard.py` in `./LaneDetection/osm_extraction`. Alternatively, download it online. (e.g. https://www.openstreetmap.org/#map=17/43.034678/-89.426753)
+- Change extracted folder name to camera_name. (e.g. US12_Park)
+- Extract `osm.net.xml.gz`.
+- Run `netconvert -s osm.net.xml --plain-output-prefix osm`, and convert to plainXML `osm.nod.xml` and `osm.edg.xml`.
 
-Under 511calibration folder, make csv file.
+4. Map Data Preprocess
+- Open `osm.net.xml` in local SUMO.
+- Trim it to have only target road (Remove unnecessary part).
 
-For your own custom data, please add mp4 video in 511video and add corresponding calibration file. Feel free to use our examples. Those preprocessed trajectory files are stored in results/511video/preprocess.
+5. Run Lane Detection
+```bash
+python main.py --T 60 --is_save --model federated
+```
+
+### Advanced Configuration
+**Federated Learning**
+```bash
+python main.py --model federated --T 60 --is_save --skip_continuous_learning --use_historical_data
+```
+
+Note: include `--skip_continuous_learning` and `--use_historical_data` if you want to skip video detection part for test, which reduce a lot of time.
+
+**Meta Learning (Training on Single Camera)**
+```bash
+python main.py --model meta --T 60 --is_save --skip_continuous_learning --use_historical_data
+```
+
+**Baseline (Fixed Parameters)**
+```bash
+python main.py --model federated --T 60 --is_save --skip_continuous_learning --use_historical_data
+```
+
+### Key Parameters
+- `--T`: Time interval for data collection (seconds)
+- `--model`: Learning approach (federated, meta, baseline)
+- `--is_save`: Save intermediate results and visualizations
+- `--use_historical_data`: Use pre-processed trajectory data
+- `--skip_continuous_learning`: Skip real-time detection
+- `--lambda_thres`: Vehicle count threshold for learning cycles
+
+### Output Structure
+```bash
+results/
+└── 511video/
+    └── model_name/
+        ├── camera_location/
+        |   ├── figures/                            # Visualizations
+        |   ├── preprocess/                         # Processed data
+        |   ├── sumo/                               # SUMO network files
+        |   ├── pixel/                              # Mid opeartion visualization
+        |   └── federated_trajectory_clustering.csv # Only for federated learning
+        └── training_results/                       # Final results
+```
+
+## Simulation Integration
+
+Look at [the detailed process](./OpenDriveConversion/README.md) to create digital twin integration.
+
+### SUMO Integration
+1. Generate SUMO network
+```bash
+bash convert_sumo2xodr.sh camera_name
+```
+
+2. Run trajectory synchroniztaion
+```bash
+python OpenDriveConversion/det2sumo_sync.py \
+    --camera_loc camera_name \
+    --dataset_path ./dataset/
+```
+
+### CARLA Integration
+
+1. Start CARLA server
+```bash
+# In CARLA directory
+make launch
+# OR
+./CarlaUE4.sh
+```
+
+2. Load generated map
+```bash
+python OpenDriveConversion/openDrive2Carla.py \
+    --map_file results/511video/camera_name/sumo/camera_name
+```
+
+3. Run co-simulation
+```bash
+python OpenDriveConversion/run_synchronization.py osm.sumocfg --sumo-gui
+```
 
 ## FedMeta-GeoLane: Federated Meta-Learning Lane Detection
 
@@ -133,6 +250,14 @@ Geo-ORBIT connects real-world observations to virtual testbeds using a synchroni
 </figure>
 
 
-## TODO
-- Input data are fixed as we provide only 60 seconds for now. It is worthwhile to try the model with extending video length and temporal video data.
-- Integrate with config.yml
+<!-- ### Citation
+If you use this work in your research, please cite:
+
+```bibtex
+@article{tamaru2025,
+  title={Geo-ORBIT: A Federated Digital Twin Framework for Scene-Adaptive Lane Geometry Detection},
+  author={Rei Tamaru, Pei Li, and Bin Ran},
+  journal={[Journal Name]},
+  year={2025}
+}
+``` -->

@@ -1,66 +1,148 @@
-# 511 video to OpenDrive Conversion
+# 511 video to OpenDrive Conversion Pipeline
 
-## Procedure
+**Note**: This pipeline is actively development and requires careful attention to coordinate system alignment and data quality. Always validate results with multiple test cases before production use. The accuracy of the final simulation depends heavily on the quality of input video data and calibration parameters.
 
-Basic procedure is following:
+## Overview
 
-Preprocess
+This conversion pipeline transforms 511 traffic camera feeds into simulation-ready formats through a multi-stage process:
 
-- OSM -> SUMO
-- Required files: .osm
-1. (Manual) Download 511 video and make it into a good length video.
-<!-- 2. (Manual) Find the same location from OpenStreetMap (OSM) with `osmWebWizard.py`. -->
-2. (Manual) Manually select target area from OpenStreetMap (OSM) from (https://www.openstreetmap.org/#map=17/43.034678/-89.426753).
+```
+511 Video → OSM Data → SUMO Network → OpenDRIVE → CARLA Simulation
+    ↓           ↓          ↓            ↓           ↓
+Real Traffic  Map Data   Network     Standard   3D Environment
+  Footage    Selection   Generation   Format     Visualization
+```
 
-Optional
-3. (Manual) Open it in SUMO.
-4. (Manual) Trim it to have only target road (Remove unnecessary part).
+## Prerequisites
 
-Place map.osm in the working folder and run, `netconvert --osm-files map.osm --o osm.net.xml`, and you'll get osmnet.net.xml.
+### Required Sofrware
+- SUMO: Traffic simulation platform with NetConvert
+- CARLA: 3D simulation environment (optional for visualization)
+- Web browser: For OpenStreetMap data selection
+- Video editing tools 
 
-**NOTE** Remove offset from netfile so Carla coordinates will match.
-GeoReference in OpenDrive will look like this. I added lat_0 and lon_0 by calculated with mean of origBoundary.
+### Data Requirements
+- 511 traffic camera footage: Live or recorded video streams. Often stored in `../dataset/results
+- GPS coordinates: Camera location for map alignment
+- Calibration data: Pixel-to-world coordinate transformation
+
+**NOTE** Remove coordinate offset for CARLA compatibility to avoid the warning.
+
+Edit the generated `osm.net.xml1 file and update the GeoReference. I added lat_0 and lon_0 by calculated with mean of origBoundary.
 ```
 <![CDATA[
  +lat_0=43.0354385 +lon_0=-89.429378 +k=1 +x_0=0 +y_0=0 +datum=WGS84 +units=m +no_defs
 ]]>
 ```
 
-OpenDrive Conversion to Carla Sync in one shell file.
+Calculate Reference Point:
+```python
+# Use mean of original boundary coordinates
+lat_0 = (lat_min + lat_max) / 2
+lon_0 = (lon_min + lon_max) / 2
+```
 
-- SUMO -> XODR with netconvert
-- Required files: .net.xml
+### OpenDrive Conversion
 
-- XODR -> Carla
-- Required files: .xodr
-5. Launch Carla server.
-6. Run `bash convert_sumo2xodr.sh {path to camera location}` to get .xodr file.
-(Option: `python openDrive2Carla.py --map_file ../results/511video/{camera location}/sumo/{camera location}`)
+1. Generate Open Drive Format
 
-7. .xodr can be viewed at odrviewer.io.
-<!-- 8. (Auto) On the different console, convert .xodr to run in Carla by running `openDrive2Carla.py`. -->
+Convert SUMO network to OpenDRIVE standard (.xodr):
+```bash
+# Automated conversion script
+bash convert_sumo2xodr.sh {path to camera location}
 
+# Manual conversion
+netconvert --opendrive-output ./results/511video/{camera location}/sumo/{camera location}.xodr --sumo-net-file ./results/511video/{camera location}/sumo/{camera location}.net.xml --junctions.scurve-stretch 0.1
 
-Trajectory
+python openDrive2Carla.py --map_file ../results/511video/{camera location}/sumo/{camera location}
+```
 
-- Detection CSV -> SUMO -> Carla
-- Required files: .csv, .osm, .net.xml, .rou.xml, .view.xml, .sumocfg
-- Copy our .view.xml and .sumocfg as needed. .rou.xml file is updated for each location and captured trajectories.
+2. Validation and Visualization
+Verify the generated OpenDRIVE file:
 
-8. Run detected trajectory in SUMO with `python det2sumo_sync.py --camera_loc {camera location}`. Make sure to have trajectory in csv file and place it in the right location. This generates vehicles.rou.xml. You can check vehicles are running in SUMO.
-8.5. On the different console, make sure to change map in Carla by running `python openDrive2Carla.py --map_file osmnet`. If you already run Step 6, ignore this.
-9. Change camera location in osm.sumocfg. Co-simulation SUMO and Carla with `python run_synchronization.py osm.sumocfg --sumo-gui`.
+- Online validation: Upload to [Online OpenDRIVE Viewer](https://odrviewer.io/)
+- Visual inspection: Check road geometry and topology
+- Coordinate verification: Ensure alignment with original location
 
+3. CARLA Map Loading
+Load the generated map into CARLA.
 
-## Make it intelligent!
+```bash
+# Start CARLA server (separate terminal)
+cd /path/to/carla
+make launch
+# OR 
+./CarlaUE4.sh
 
-[ ] Location can be automatically cripped such as finding the same location bounding box easily by codes. Then extract all nodes with api/0.6/map. Or auto-select bounding box at osmWebWizard.
-[ ] Auto-select (auto-remove) target road.
-[ ] Use Video Positioning System (VPS) to automatically select the scene.
-[ ] Calibrate or evaluate with lane detection from clustered trajectories.
-[ ] Auto-alignment to original image (e.g. image reconstruction, morphing, or doing like SPADE?)
+# Load custom map
+python openDrive2Carla.py \
+    --map_file ./results/511video/camera_name/sumo/{camera_name}
+```
 
-## Questions
+CARLA Generation Parameters:
+```python
+carla.OpendriveGenerationParameters(
+    vertex_distance=2.0,      # Road mesh resolution
+    max_road_length=500.0,    # Segment length limit
+    wall_height=1.0,          # Barrier height
+    additional_width=0.6,     # Lane width buffer
+    smooth_junctions=True,    # Junction smoothing
+    enable_mesh_visibility=True
+)
+```
 
-- Google map can recognize lanes while OSM totally relies on user inputs, which may lead some mistakes. Thus, we need to justify the number of lanes with acuumulated trajectories.
-- Also, we should estimate lane widths with some way.
+4. Trajectory Synchronization
+Convert video trajetories to SUMO format:
+```bash
+python det2sumo_sync.py --camera_loc {camera location}
+```
+
+**Input Requirements:**
+- `federated_trajectory_clustering.csv`: Vehice trajectories from video analysis after lane detection. Currently, it is only supported for files generated by federated mode.
+- `camera_calibration.csv`: Pixel-to-GPS transformation data
+- `osm.net.xml`: SUMO network file
+
+**Generated Output:**
+- `vehicles.rou.xml`: SUMO route definitions
+- `replay_results.csv`: Synchronization log
+
+**Optional:**
+If you have already done above codes and just want to start from synchronization, please run CARLA and change the map by `python openDrive2Carla.py --map_file osm`. If you already run above steps, ignore this.
+
+5. Multi-Simulator Synchronization
+Run coordinated SUMO-CARLA simulation:
+```bash
+# Configure simulation
+# Edit osm.sumocfg to specify correct camera location
+
+# Run co-simulation
+python run_synchronization.py osm.sumocfg --sumo-gui 
+```
+
+## Advanced Configuration (To be verified)
+
+This is implemented by not verified yet.
+
+### Trajectory Preprocessing Options
+
+```python
+from OpenDriveConversion.det2sumo_sync import ImprovedDet2SumoSync
+
+syncer = ImprovedDet2SumoSync(saving_file_path, camera_loc, dataset_path)
+
+# Advanced preprocessing
+syncer.preprocess_trajectories(
+    interpolate=True,          # Smooth temporal sampling
+    validate_lanes=True,       # Check lane consistency
+    remove_outliers=True,      # Filter unrealistic trajectories
+    target_fps=30,             # Output frame rate
+    max_speed=50.0,            # Speed validation (m/s)
+    max_acceleration=5.0       # Acceleration limit (m/s²)
+)
+```
+
+### Performance Bottlenecks
+**Problems**
+- In the current algorithm, vehicles are placed on the detected lanes. However, their behavior follows SUMO algorithm.
+- Currently running only on historical data, not acturally real-time synchronization.
+- Hardly depending on the manual data extraction including data calibration.
