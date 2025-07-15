@@ -157,10 +157,8 @@ class GeometricLearning:
         return lane_boundaries_by_id
 
 
-    def run(
-            self, c_epoch, g_epoch, traj_df,
-            camera_loc, trial, is_save
-        ):
+    def run(self, c_epoch, g_epoch, traj_df,
+            camera_loc, trial, is_save):
         """
         Process Geometrical Learning
 
@@ -277,12 +275,6 @@ class GeometricLearning:
                     lane_df = df_plot[df_plot["clustered_id"] == lane_id]
 
                     if is_save:
-                        # ax2.scatter(lane_df["x_gps"], lane_df["y_gps"], s=1, alpha=0.5, label=f"Lane {lane_id}", color=self.colors[int(lane_id)]) 
-                        # ax3.scatter(lane_df["x_gps"], lane_df["y_gps"], s=1, alpha=0.5, label=f"Lane {lane_id}", color=self.colors[int(lane_id)])
-                        # ax3.plot(data["center"][:, 0], data["center"][:, 1], color=self.colors[int(lane_id)], linewidth=2.5, label=f"Lane Centerline {lane_id}")
-                        # ax3.plot(data["left"][:, 0], data["left"][:, 1], color=self.colors[int(lane_id)], linewidth=1.0)
-                        # ax3.plot(data["right"][:, 0], data["right"][:, 1], color=self.colors[int(lane_id)], linewidth=1.0)
-
                         # Temporary lat and lon is opposite
                         ax2.scatter(lane_df["y_gps"], lane_df["x_gps"], s=1, alpha=0.5, label=f"Lane {lane_id}", color=self.colors[int(lane_id)]) 
                         ax3.scatter(lane_df["y_gps"], lane_df["x_gps"], s=1, alpha=0.5, label=f"Lane {lane_id}", color=self.colors[int(lane_id)])

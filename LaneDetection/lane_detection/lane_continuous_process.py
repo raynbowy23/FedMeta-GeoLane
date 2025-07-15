@@ -23,12 +23,13 @@ class CameraData:
 class LaneContinuousProcess:
     """Continuous Data Collection
     """
-    def __init__(self, args, saving_file_path, camera_loc_list):
+    def __init__(self, args, saving_path, camera_loc_list):
         self.left_lane_nums = 0
         self.right_lane_nums = 0
         self.lambda_thres = args.lambda_thres
-        self.filepath = saving_file_path
-        self.saving_file_path = Path(saving_file_path)
+        # self.filepath = saving_path
+        self.preprocess_path = Path(saving_path, "preprocess")
+        self.saving_file_path = Path(saving_path, args.model)
         self.camera_loc_list = camera_loc_list
 
         self.data_by_camera = {}
@@ -47,10 +48,7 @@ class LaneContinuousProcess:
         if not args.skip_continuous_learning:
             self.detector = YOLOV11()
 
-    def continuous_process(
-            self,
-            args,
-            c_epoch):
+    def continuous_process(self, args, c_epoch):
         """Continuous Data Collection Process for Lane Learning
 
         Args:
@@ -62,6 +60,7 @@ class LaneContinuousProcess:
         """
 
         self.vehicle_collected = False
+        skip_continuous_learning = args.skip_continuous_learning
         frame_id = 0 
 
         # Multiple video data in the self.video_path directory
@@ -91,22 +90,32 @@ class LaneContinuousProcess:
                     self.track_model = YOLO("yolo11n.pt")
 
                     fig_filepath = Path(self.saving_file_path, camera_loc, "figures")
-                    pre_filepath = Path(self.saving_file_path, camera_loc, "preprocess")
+                    pre_filepath = Path(self.preprocess_path, camera_loc)
 
                     # Accumulate historical data to current streams
-                    if (args.use_historical_data or args.skip_continuous_learning): #and c_epoch != 0:
-                        last_frame = np.load(Path(pre_filepath, f"last_frame.npy"))
-                        collect_cars_list = np.load(Path(pre_filepath, f"collect_cars.npy")).tolist()
-                        collect_det_dots_including_truck_list = np.load(Path(pre_filepath, f"collect_det_dots_including_truck.npy")).tolist()
-                        # Convert back to tuples
-                        collect_cars = [tuple(item) if isinstance(item, list) else item for item in collect_cars_list]
-                        collect_det_dots_including_truck = [tuple(item) if isinstance(item, list) else item for item in collect_det_dots_including_truck_list]
-                        out_df = pl.read_csv(
-                            Path(pre_filepath, f"trajectory.csv"),
-                            schema_overrides={"target_lane_id": pl.Utf8}
-                        )
+                    # TODO: Need to keep continuously data stack on the previous data for continuous learning
+                    # TODO: Update the data to keep it manageable size
+                    if (args.use_historical_data or skip_continuous_learning) and pre_filepath.exists():
+                        # Define paths
+                        last_frame_path = Path(pre_filepath, "last_frame.npy")
 
-                    if not args.skip_continuous_learning: #or c_epoch == 0:
+                        # Check and load
+                        if last_frame_path.exists():
+                            last_frame = np.load(last_frame_path)
+                            collect_cars_list = np.load(Path(pre_filepath, f"collect_cars.npy")).tolist()
+                            collect_det_dots_including_truck_list = np.load(Path(pre_filepath, f"collect_det_dots_including_truck.npy")).tolist()
+
+                            # Convert back to tuples
+                            collect_cars = [tuple(item) if isinstance(item, list) else item for item in collect_cars_list]
+                            collect_det_dots_including_truck = [tuple(item) if isinstance(item, list) else item for item in collect_det_dots_including_truck_list]
+                            out_df = pl.read_csv(
+                                Path(pre_filepath, f"trajectory.csv"),
+                                schema_overrides={"target_lane_id": pl.Utf8}
+                            )
+                        else:
+                            skip_continuous_learning = False # Temporal workaround. If no historical data, need to run continuous learning
+
+                    if not skip_continuous_learning:
 
                         track_history = defaultdict(lambda: [])
                         frame_time = 0

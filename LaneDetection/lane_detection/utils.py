@@ -35,7 +35,7 @@ def create_binary_image_utils(learning_cycle, vehicles, frame, filepath, is_save
             axes = (int(w // 3.5), int(h // 3.5))
             # axes = (int(w // 8), int(h // 8))
             cv2.ellipse(binary_image, center, axes, angle=0, startAngle=0, endAngle=360, color=(1), thickness=-1)
-
+        
     binary_image = (binary_image * 255).astype(np.uint8)
     if is_save:
         cv2.imwrite(Path(filepath, f"{learning_cycle}_binary_heatmap_area.png"), binary_image)

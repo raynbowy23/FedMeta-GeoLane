@@ -1,12 +1,9 @@
-import cv2
 import torch
 import numpy as np
 import logging
 import matplotlib.pyplot as plt
 import matplotlib
 import pickle
-import json
-import polars as pl
 from pathlib import Path
 from PIL import Image
 
@@ -20,7 +17,7 @@ logger = logging.getLogger(__name__)
 
 
 def compute_loss_for_baseline(geo_learning, traj_df, lane_boundaries_for_contour, processed_data, client_id):
-    """Wrapper function of compute_loss in GeometricLeanrning, executing geometric learning and compute loss."""
+    """Wrapper function of compute_loss in GeometricLearnning, executing geometric learning and compute loss."""
     try:
         
         # Convert to pandas if still in Polars
@@ -28,7 +25,6 @@ def compute_loss_for_baseline(geo_learning, traj_df, lane_boundaries_for_contour
         # Filter out unassigned or invalid lane clusters
         traj_df_pd = traj_df_pd[traj_df_pd["clustered_id"] != -1]
 
-        # Create osm_connection if not provided
         osm_connection = OSMConnection(geo_learning.args, geo_learning.filepath)
 
         # Visualization setup
@@ -46,7 +42,7 @@ def compute_loss_for_baseline(geo_learning, traj_df, lane_boundaries_for_contour
         detected_center_list = []
         lane_width_list = []
         
-        for boundaries in lane_boundaries_for_contour:
+        for cnt_id, boundaries in lane_boundaries_for_contour.items():
             for lane_id, data in boundaries.items():
                 detected_center_list.append(data["center"])
                 widths, avg_width = compute_lane_width_from_gps(data["left"], data["right"])
@@ -161,7 +157,7 @@ def _visualize_lane_detection(traj_df_pd, lane_boundaries_for_contour,
             logger.error(f"Failed to load image from {img_path}. Using blank background.")
 
     # Plot lane detection results
-    for boundaries in lane_boundaries_for_contour:
+    for cnt_id, boundaries in lane_boundaries_for_contour.items():
         for lane_count, (lane_id, data) in enumerate(boundaries.items()):
             color = colors[lane_count % len(colors)]
             
@@ -272,225 +268,3 @@ def save_training_results(system, training_history, save_path):
 def estimate_object_size_bytes(obj):
     """Serialize and estimate object size in bytes."""
     return len(pickle.dumps(obj))
-
-
-# class LaneAssignmentPostProcessor:
-#     """
-#     Post-processes trajectory CSV to add lane assignments after geometric learning
-#     """
-#     def __init__(self, args, saving_file_path):
-#         self.args = args
-#         self.saving_file_path = saving_file_path
-        
-#     def assign_vehicles_to_detected_lanes(self, traj_df, lane_boundaries_for_contour, 
-#                                         pixel_hom, camera_loc, epoch):
-#         """
-#         Assign vehicles in trajectory DataFrame to detected lanes
-        
-#         Args:
-#             traj_df: Trajectory DataFrame from continuous process
-#             lane_boundaries_for_contour: Detected lane boundaries from geometric learning
-#             pixel_hom: Pixel homography transformation
-#             camera_loc: Camera location identifier
-#             epoch: Current epoch number
-            
-#         Returns:
-#             Enhanced DataFrame with lane assignments
-#         """
-#         try:
-#             # Convert to pandas for easier processing
-#             if hasattr(traj_df, 'to_pandas'):
-#                 traj_df_pd = traj_df.to_pandas()
-#             else:
-#                 traj_df_pd = traj_df
-            
-#             # Initialize new columns
-#             traj_df_pd['assigned_lane'] = -1
-#             traj_df_pd['lane_distance'] = -1.0
-#             traj_df_pd['lane_confidence'] = 0.0
-#             traj_df_pd['num_lanes_detected'] = 0
-            
-#             # Process each detected lane boundary
-#             lane_centers = {}
-#             total_lanes = 0
-            
-#             for contour_idx, boundaries in enumerate(lane_boundaries_for_contour):
-#                 for lane_id, lane_data in boundaries.items():
-#                     # Extract lane center coordinates
-#                     lane_center = lane_data.get("center", np.array([]))
-#                     if len(lane_center) > 0:
-#                         lane_centers[total_lanes] = {
-#                             'center_coords': lane_center,
-#                             'original_lane_id': lane_id,
-#                             'contour_idx': contour_idx,
-#                             'width': lane_data.get("width", 3.5)
-#                         }
-#                         total_lanes += 1
-            
-#             # Update total lanes detected
-#             traj_df_pd['num_lanes_detected'] = total_lanes
-            
-#             if total_lanes == 0:
-#                 logger.warning(f"No lanes detected for {camera_loc} at epoch {epoch}")
-#                 return pl.from_pandas(traj_df_pd)
-            
-#             # Just put each vehicle position to detected lane id
-#             # Assign each vehicle position to closest lane
-#             for idx, row in traj_df_pd.iterrows():
-#                 vehicle_x, vehicle_y = row['x'], row['y']
-                
-#                 # Convert vehicle position if homography is available
-#                 if pixel_hom is not None:
-#                     try:
-#                         # Transform vehicle pixel coordinates to GPS/world coordinates
-#                         vehicle_pos = np.array([[vehicle_x, vehicle_y]], dtype=np.float32)
-#                         vehicle_world = cv2.perspectiveTransform(
-#                             vehicle_pos.reshape(-1, 1, 2), pixel_hom
-#                         ).reshape(-1, 2)[0]
-#                         vehicle_x_world, vehicle_y_world = vehicle_world
-#                     except:
-#                         vehicle_x_world, vehicle_y_world = vehicle_x, vehicle_y
-#                 else:
-#                     vehicle_x_world, vehicle_y_world = vehicle_x, vehicle_y
-                
-#                 # Find closest lane
-#                 min_distance = float('inf')
-#                 closest_lane = -1
-#                 confidence = 0.0
-                
-#                 for lane_idx, lane_info in lane_centers.items():
-#                     lane_center_coords = lane_info['center_coords']
-                    
-#                     # Calculate minimum distance to lane centerline
-#                     distances = []
-#                     for center_point in lane_center_coords:
-#                         if len(center_point) >= 2:
-#                             dist = np.sqrt(
-#                                 (vehicle_x_world - center_point[0])**2 + 
-#                                 (vehicle_y_world - center_point[1])**2
-#                             )
-#                             distances.append(dist)
-                    
-#                     if distances:
-#                         avg_distance = np.mean(distances)
-#                         min_dist_to_lane = min(distances)
-                        
-#                         if min_dist_to_lane < min_distance:
-#                             min_distance = min_dist_to_lane
-#                             closest_lane = lane_idx
-                            
-#                             # Calculate confidence based on distance and lane width
-#                             lane_width = lane_info.get('width', 3.5)
-#                             # Confidence decreases with distance, max at lane center
-#                             confidence = max(0, 1.0 - (min_dist_to_lane / (lane_width * 2)))
-                
-#                 # Assign vehicle to lane if within reasonable distance
-#                 distance_threshold = 100 # pixels, or adjust based on your coordinate system
-#                 if min_distance < distance_threshold and confidence > 0.1:
-#                     # THIS IS WRONG
-#                     traj_df_pd.at[idx, 'assigned_lane'] = closest_lane
-#                     traj_df_pd.at[idx, 'lane_distance'] = float(min_distance)
-#                     traj_df_pd.at[idx, 'lane_confidence'] = float(confidence)
-            
-#             # Add additional lane statistics
-#             enhanced_df = self._add_lane_statistics(pl.from_pandas(traj_df_pd))
-            
-#             # Save enhanced trajectory CSV
-#             self._save_enhanced_trajectory(enhanced_df, camera_loc, epoch)
-            
-#             logger.info(f"Successfully assigned {total_lanes} lanes to vehicles for {camera_loc}")
-#             return enhanced_df
-            
-#         except Exception as e:
-#             logger.error(f"Error in lane assignment for {camera_loc}: {e}")
-#             return traj_df
-    
-#     def _add_lane_statistics(self, df):
-#         """Add lane-related statistics to the DataFrame"""
-#         try:
-#             # Sort by vehicle ID and time for proper sequence analysis
-#             df = df.sort(["id", "time"])
-            
-#             # Add lane change detection
-#             df = df.with_columns([
-#                 # Detect lane changes (when assigned_lane changes for same vehicle)
-#                 (pl.col("assigned_lane").diff().over("id") != 0).cast(pl.Int8).alias("lane_changed"),
-                
-#                 # Count consecutive frames in same lane
-#                 pl.col("assigned_lane").rle_id().over("id").alias("lane_segment_id"),
-                
-#                 # Calculate vehicle's primary (most frequent) lane
-#                 pl.col("assigned_lane").mode().over("id").alias("primary_lane")
-#             ])
-            
-#             # Add lane stability metrics
-#             df = df.with_columns([
-#                 # Time spent in current lane segment
-#                 pl.col("lane_segment_id").count().over(["id", "lane_segment_id"]).alias("time_in_current_lane"),
-                
-#                 # Average confidence in lane assignment for this vehicle
-#                 pl.col("lane_confidence").mean().over("id").alias("avg_lane_confidence")
-#             ])
-            
-#             return df
-            
-#         except Exception as e:
-#             logger.warning(f"Could not add lane statistics: {e}")
-#             return df
-    
-#     def _save_enhanced_trajectory(self, enhanced_df, camera_loc, epoch):
-#         """Save the enhanced trajectory CSV with lane assignments"""
-#         try:
-#             pre_filepath = Path(self.saving_file_path, camera_loc, "preprocess")
-            
-#             # Save enhanced trajectory
-#             enhanced_csv_path = Path(pre_filepath, f"trajectory_with_lanes_epoch_{epoch}.csv")
-#             enhanced_df.write_csv(enhanced_csv_path)
-            
-#             # Also update the main trajectory.csv
-#             main_csv_path = Path(pre_filepath, "trajectory.csv")
-#             enhanced_df.write_csv(main_csv_path)
-            
-#             # Save lane assignment summary
-#             lane_summary = self._create_lane_summary(enhanced_df)
-#             summary_path = Path(pre_filepath, f"lane_summary_epoch_{epoch}.json")
-            
-#             with open(summary_path, 'w') as f:
-#                 json.dump(lane_summary, f, indent=2)
-            
-#             logger.info(f"Saved enhanced trajectory to {enhanced_csv_path}")
-            
-#         except Exception as e:
-#             logger.error(f"Error saving enhanced trajectory: {e}")
-    
-#     def _create_lane_summary(self, df):
-#         """Create a summary of lane assignments"""
-#         try:
-#             summary = {
-#                 'total_vehicles': df['id'].n_unique(),
-#                 'total_frames': len(df),
-#                 'lanes_detected': int(df['num_lanes_detected'].max()),
-#                 'vehicles_assigned': len(df.filter(pl.col('assigned_lane') >= 0)),
-#                 'assignment_rate': float(len(df.filter(pl.col('assigned_lane') >= 0)) / len(df)),
-#                 'avg_confidence': float(df['lane_confidence'].mean()),
-#                 # 'lane_changes_detected': int(df['lane_changed'].sum())
-#             }
-            
-#             # Per-lane statistics
-#             lane_stats = {}
-#             for lane_id in range(int(df['num_lanes_detected'].max())):
-#                 lane_vehicles = df.filter(pl.col('assigned_lane') == lane_id)
-#                 if len(lane_vehicles) > 0:
-#                     lane_stats[f'lane_{lane_id}'] = {
-#                         'vehicle_count': lane_vehicles['id'].n_unique(),
-#                         'total_detections': len(lane_vehicles),
-#                         'avg_confidence': float(lane_vehicles['lane_confidence'].mean()),
-#                         'avg_distance': float(lane_vehicles['lane_distance'].mean())
-#                     }
-            
-#             summary['per_lane_stats'] = lane_stats
-#             return summary
-            
-#         except Exception as e:
-#             logger.error(f"Error creating lane summary: {e}")
-#             return {}

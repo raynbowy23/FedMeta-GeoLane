@@ -269,7 +269,7 @@ class Det2SumoSync:
         # Load the trajectory CSV once at initialization
         # self.trajectory_df = pl.read_csv(Path(self.pre_filepath, csv_name))
         # trajectory_csv = f"../results/511video/{args.mode}/{args.camera_loc}/{args.mode}_trajectory_clustering.csv"
-        trajectory_csv = f"../results/511video/federated/{camera_loc}/federated_trajectory_clustering.csv"
+        trajectory_csv = f"../results/federated/{camera_loc}/federated_trajectory_clustering.csv"
         self.trajectory_df = pl.read_csv(trajectory_csv, schema_overrides={"target_lane_id": pl.Utf8})
         
         # Get gps, pixel points from text file in each camera location
@@ -667,7 +667,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     # trajectory_csv = f"../results/511video/{args.camera_loc}/preprocess/trajectory.csv"
-    trajectory_csv = f"../results/511video/{args.mode}/{args.camera_loc}/{args.mode}_trajectory_clustering.csv"
+    trajectory_csv = f"../results/{args.mode}/{args.camera_loc}/{args.mode}_trajectory_clustering.csv"
     net_file = f"{args.camera_loc}.net.xml"
 
     file_name_ = Path(args.video_path).stem

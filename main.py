@@ -6,7 +6,6 @@ matplotlib.use('Agg')
 import random
 import mlflow
 
-
 import numpy as np
 import cv2
 import time
@@ -27,7 +26,7 @@ parser.add_argument('--num_grids', type=int, default=50, help='Number of grids i
 parser.add_argument('--seed', default=42, help="seed number", type=int)
 parser.add_argument('--dataset_path', default='./dataset/', help='dataset path')
 parser.add_argument('--video_path', default='./dataset/511video', help='camera ip or local video path')
-parser.add_argument('--saving_path', default='./results/', help='path to save results')
+parser.add_argument('--saving_path', default='./results', help='path to save results')
 parser.add_argument('--T', type=int, default=60, help='Time interval of each cycle, the unit is second')
 parser.add_argument('--is_save', action='store_true', help='Save the results or not')
 parser.add_argument('--conf_thre', type=float, default='0.25', help='Detection confidence score threshold when creating '
@@ -61,13 +60,11 @@ if not logger.hasHandlers():
 logger.info("Logging is working!")
 
 file_name_ = Path(args.video_path).stem
-saving_file_path = Path(args.saving_path, file_name_, args.model)
+saving_file_path = Path(args.saving_path, args.model)
+preprocess_path = Path(args.saving_path, "preprocess")
 os.makedirs(saving_file_path, exist_ok=True)
 logger.info(f"Filepath: {saving_file_path}")
 fig_filepath = Path(saving_file_path, "figures")
-
-# meta_model = MetaMLModel()
-# optimizer = torch.optim.Adam(meta_model.parameters(), lr=1e-3)
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -79,11 +76,9 @@ with open(Path(args.dataset_path, "camera_location_list.txt"), 'r') as f:
         print(camera_loc_name)
 
         # Set up file path for each camera_loc_name
+        Path(preprocess_path, camera_loc_name).mkdir(parents=True, exist_ok=True) # Preprocess path, shared by all models
         Path(saving_file_path, camera_loc_name).mkdir(parents=True, exist_ok=True)
         Path(saving_file_path, camera_loc_name, "figures").mkdir(parents=True, exist_ok=True) # Figure path
-        Path(saving_file_path, camera_loc_name, "preprocess").mkdir(parents=True, exist_ok=True) # Preprocess
-        Path(saving_file_path, camera_loc_name, "preprocess", "graph").mkdir(parents=True, exist_ok=True) # Graph path
-        Path(saving_file_path, camera_loc_name, "pixel").mkdir(parents=True, exist_ok=True) # Pixel path
         Path(saving_file_path, camera_loc_name, "sumo").mkdir(parents=True, exist_ok=True) # Sumo path
 
         # Copy SUMO files
@@ -136,7 +131,7 @@ def main():
         # Start continuous data collection thread
         continuous_thread = threading.Thread(
             target=continuous_process,
-            args=(args, CONT_EPOCHS, data_queue, stop_event, saving_file_path, camera_loc_list, barrier)
+            args=(args, CONT_EPOCHS, data_queue, stop_event, args.saving_path, camera_loc_list, barrier)
         )
     
         # Start geometric learning thread

@@ -1,17 +1,9 @@
-<div id="top" align="center">
-<p align="center">
-  <strong>
-    <h1 align="center">Geo-ORBIT</h1>
-    <!-- <h3 align="center"><a href="">Website</a> | <a href="#">Paper</a></h3> -->
-  </strong>
-</p>
-</div>
+<h1 align="center">Geo-ORBIT: A Federated Digital Twin Framework for Scene-Adaptive Lane Geometry Detection</h1>
 
-> Geo-ORBIT: A Federated Digital Twin Framework for Scene-Adaptive Lane Geometry Detection (Paper be uploaded)
->
-> **Authors**: [Rei Tamaru](https://tamaru.com), [Pei Li](https://scholar.google.com/citations?user=0QzhzL0AAAAJ), and [Bin Ran](https://scholar.google.com/citations?user=Kg5OoCUAAAAJ)
->
-> **Affiliation**: University of Wisconsin–Madison
+<div align="center">
+<p>
+<a href="https://arxiv.org/abs/2507.08743">Paper<a> | <a href="https://reitamaru.com">Rei Tamaru</a>, <a href="https://scholar.google.com/citations?user=0QzhzL0AAAAJ">Pei Li</a>, and <a href="https://scholar.google.com/citations?user=Kg5OoCUAAAAJ">Bin Ran</a> | University of Wisconsin–Madison</p>
+</div>
 
 ---
 
@@ -175,7 +167,7 @@ make launch
 2. Load generated map
 ```bash
 python OpenDriveConversion/openDrive2Carla.py \
-    --map_file results/511video/camera_name/sumo/camera_name
+    --map_file results/camera_name/sumo/camera_name
 ```
 
 3. Run co-simulation
@@ -183,7 +175,7 @@ python OpenDriveConversion/openDrive2Carla.py \
 python OpenDriveConversion/run_synchronization.py osm.sumocfg --sumo-gui
 ```
 
-## FedMeta-GeoLane: Federated Meta-Learning Lane Detection
+## (Short Summary) FedMeta-GeoLane: Federated Meta-Learning Lane Detection
 
 FedMeta-GeoLane treats each roadside camera deployment as a unique task. A shared meta-learner predicts optimal detection parameters using context features like vehicle speed and trajectory distribution. Key highlights include:
 
@@ -250,14 +242,14 @@ Geo-ORBIT connects real-world observations to virtual testbeds using a synchroni
 </figure>
 
 
-<!-- ### Citation
+## Citation
 If you use this work in your research, please cite:
 
 ```bibtex
-@article{tamaru2025,
+@article{tamaru2025geo,
   title={Geo-ORBIT: A Federated Digital Twin Framework for Scene-Adaptive Lane Geometry Detection},
-  author={Rei Tamaru, Pei Li, and Bin Ran},
-  journal={[Journal Name]},
+  author={Tamaru, Rei and Li, Pei and Ran, Bin},
+  journal={arXiv preprint arxiv:2507.08743},
   year={2025}
 }
-``` -->
+```

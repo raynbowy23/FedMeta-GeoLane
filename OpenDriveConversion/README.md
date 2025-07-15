@@ -52,9 +52,9 @@ Convert SUMO network to OpenDRIVE standard (.xodr):
 bash convert_sumo2xodr.sh {path to camera location}
 
 # Manual conversion
-netconvert --opendrive-output ./results/511video/{camera location}/sumo/{camera location}.xodr --sumo-net-file ./results/511video/{camera location}/sumo/{camera location}.net.xml --junctions.scurve-stretch 0.1
+netconvert --opendrive-output ./results/{camera location}/sumo/{camera location}.xodr --sumo-net-file ./results/{camera location}/sumo/{camera location}.net.xml --junctions.scurve-stretch 0.1
 
-python openDrive2Carla.py --map_file ../results/511video/{camera location}/sumo/{camera location}
+python openDrive2Carla.py --map_file ../results/{camera location}/sumo/{camera location}
 ```
 
 2. Validation and Visualization
@@ -76,7 +76,7 @@ make launch
 
 # Load custom map
 python openDrive2Carla.py \
-    --map_file ./results/511video/camera_name/sumo/{camera_name}
+    --map_file ./results/camera_name/sumo/{camera_name}
 ```
 
 CARLA Generation Parameters:

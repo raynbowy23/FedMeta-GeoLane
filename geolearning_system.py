@@ -413,7 +413,7 @@ class GeoLearningSystem:
 
         try:
             # Run geometric learning
-            traj_df, lane_boundaries = geo_learning.run(
+            traj_df, lane_boundaries_for_contour = geo_learning.run(
                 c_epoch=processed_data.get('c_epoch', 0),
                 g_epoch=processed_data.get('g_epoch', 0),
                 traj_df=processed_data['gps_df'],
@@ -422,12 +422,25 @@ class GeoLearningSystem:
                 is_save=geo_learning.is_save
             )
 
-            loss, metrics = compute_loss_for_baseline(
-                geo_learning, traj_df, lane_boundaries, 
-                processed_data, client_id
-            )
+            # Extract detected centers and compute lane widths
+            detected_center_list = []
             
-            return loss, metrics
+            for cnts, boundaries in lane_boundaries_for_contour.items():
+                for lane_id, data in boundaries.items():
+
+                    detected_center_list.append(data["center"])
+
+            if len(detected_center_list) > 0:
+                loss, metrics = compute_loss_for_baseline(
+                    geo_learning, traj_df, lane_boundaries_for_contour, 
+                    processed_data, client_id
+                )
+                
+                return loss, metrics
+            else:
+                # No lanes detected
+                logger.warning(f"No lanes detected for client {client_id}")
+                return float('inf'), {'lane_count': 0, 'error': 'No lanes detected'}
             
         except Exception as e:
             logger.error(f"Error in geo_learning for client {client_id}: {e}")

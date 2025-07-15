@@ -5,8 +5,6 @@ import matplotlib
 import matplotlib.pyplot as plt
 matplotlib.set_loglevel(level = 'warning')
 import logging
-import random
-import string
 logger = logging.getLogger(__name__)
 
 import sumolib
@@ -15,11 +13,8 @@ import polars as pl
 
 from sklearn.cluster import DBSCAN
 from scipy.spatial import cKDTree
-import matplotlib.image as mpimg
-from matplotlib.colors import to_hex
-from matplotlib.colors import ListedColormap
-from collections import Counter, defaultdict
-from shapely.geometry import MultiPoint, Point, LineString, Polygon
+from collections import Counter
+from shapely.geometry import MultiPoint, Point, LineString
 
 from pathlib import Path
 import xml.etree.ElementTree as ET
@@ -67,43 +62,6 @@ class OSMConnection:
             (1.00, 0.60, 0.00),  # vivid amber
         ]
 
-
-    def get_nodes(self, camera_loc):
-        tree = ET.parse(Path(self.sumo_filepath, camera_loc, 'osm.nod.xml'))
-        root = tree.getroot()
-
-        # sumo_nodes = {
-        #     node.attrib['id']: (np.float64(node.attrib['x']), np.float64(node.attrib['y']))
-        #     for node in root
-        # }
-
-        nodes = root.findall("node")  
-
-        sumo_nodes = {
-            node.attrib['id']: (np.float64(node.attrib['x']), np.float64(node.attrib['y']))
-            for node in nodes if 'id' in node.attrib and 'x' in node.attrib and 'y' in node.attrib
-        }
-
-        return sumo_nodes
-
-    def get_edges(self, camera_loc):
-        tree = ET.parse(Path(self.sumo_filepath, camera_loc, 'osm.edg.xml'))
-        root = tree.getroot()
-
-        sumo_lane_geometries = {}
-        for edge in root.findall('edge'):
-            lane_id = edge.get('id')
-            try:
-                shape = edge.get('shape')
-                # Convert shape to list of coordinates
-                points = [tuple(map(np.float64, p.split(','))) for p in shape.split()]
-                points = [(x, y) for x, y in points]
-                sumo_lane_geometries[lane_id] = points
-            except:
-                continue
-
-        return sumo_lane_geometries
-
     def get_net(self, camera_loc):
         tree = ET.parse(Path(self.sumo_filepath, camera_loc, self.sumo_netfile))
         root = tree.getroot()
@@ -141,11 +99,7 @@ class OSMConnection:
 
         return lane_geometries, lane_edge_geometries, grouped_lane_edge_geometries, lane_id_list, lane_shape
     
-    def compute_polyline_length(
-            self,
-            shape_str,
-            camera_loc
-        ):
+    def compute_polyline_length(self, shape_str, camera_loc):
         """Return the lane length complying with the GPS coordinates
         """
         # Parse shape string into Nx2 array
@@ -161,12 +115,7 @@ class OSMConnection:
         segment_lengths = np.linalg.norm(deltas, axis=1)
         return segment_lengths.sum()
 
-    def global_to_sumo(
-            self,
-            nodes,
-            lane_geometries,
-            lane_id_list
-        ):
+    def global_to_sumo(self, nodes, lane_geometries, lane_id_list):
         """
         Transform GPS coordinates to SUMO coordinates using homography transformation.
 
@@ -212,11 +161,7 @@ class OSMConnection:
 
         return hom, sumo_coordinate
 
-    def gps_to_sumo(
-            self,
-            gps_points,
-            camera_loc
-        ) -> np.array:
+    def gps_to_sumo(self, gps_points, camera_loc) -> np.array:
         """
         Convert GPS coordinates to SUMO coordinates using the inverse homography transformation.
 
@@ -298,7 +243,7 @@ class OSMConnection:
         """
 
         root_filepath = Path(self.dataset_path, '511calibration')
-        pixel_filepath = Path(self.filepath, camera_loc, 'pixel')
+        pixel_filepath = Path(self.filepath, camera_loc)
 
         plt.figure(figsize=(10, 20))
 
@@ -341,32 +286,9 @@ class OSMConnection:
         sumo_lane_ids = np.array(sumo_lane_ids)
         sumo_kdtree = cKDTree(all_sumo_points)
 
-        # Colors for different lane groups
-        # colors = plt.cm.tab20(np.linspace(0, 1, len(grouped_lane_edge_geometries)))
-        # colors = [to_hex(tuple(float(c) for c in rgba)) for rgba in plt.cm.tab20(np.linspace(0, 1, len(grouped_lane_edge_geometries)))]
-        # Normalize and add alpha=1
-        # colors_rgba = [tuple(c / 255 for c in rgb) + (1.0,) for rgb in self.colors]
-        # colors = [to_hex(tuple(float(c) for c in rgba)) for rgba in colors_rgba]
-        # my_cmap = ListedColormap(colors)
-        # colors = my_cmap(np.linspace(0, 1, len(grouped_lane_edge_geometries)))
-
-        # edge_colors = {}
-        
-        # # Plot lanes in gps coordinates
-        # for group_id, lane_ids in grouped_lane_edge_geometries.items():
-        #     edge_colors[group_id] = colors[group_id % len(colors)]
-            
-        #     for lane_id in lane_ids:
-        #         if lane_id in gps_lane_geometries:
-        #             points = gps_lane_geometries[lane_id]
-        #             plt.plot(points[:, 0], points[:, 1], 'o-', 
-        #                     color=edge_colors[group_id], alpha=0.7, linewidth=2, 
-        #                     markersize=4, label=f'Lane {lane_id}' if lane_id == lane_ids[0] else "")
-
-        ### TODO: Identify each lane group and create pseudo_lane_ids for each groups [0, 1, 2, 3] for group 0.
-        ### 1. Need to find the closest lane groups from the trajectory points and create target area
-        ### 2. Lane groups are determined based on the trajectory points. Change it to left to right. Create pseudo lane ids.
-        sumo_kdtree = cKDTree(all_sumo_points)  # all_sumo_points is (N,2) array of SUMO lane points
+        # Identify each lane group and create pseudo_lane_ids for each groups [0, 1, 2, 3] for group 0.
+        # Find the closest lane groups from the trajectory points and create target area
+        sumo_kdtree = cKDTree(all_sumo_points) # all_sumo_points is (N,2) array of SUMO lane points
         trajectory_points = gps_df.select(pl.col('x', 'y')).to_numpy().astype(np.float64)
         x_gps = gps_df["x_gps"].to_numpy().copy()
         y_gps = gps_df["y_gps"].to_numpy().copy()
@@ -435,7 +357,7 @@ class OSMConnection:
                         lane_group_dict[lane_group] = {-1: np.zeros((10, 2))}
                     if lane_id in target_lanes: # Only keep lanes with enough nearby trajectory points
 
-                        # We want to regulate points to only proximity, otherwise SUMO will be too large so we cannot compare fairly
+                        # We want to regulate points to only proximity, otherwise SUMO covers larger area so we cannot compare fairly
                         # points are SUMO, gps_traj_points are GPS
 
                         # Convert to shapely geometries
@@ -511,11 +433,6 @@ class OSMConnection:
             handles, labels = plt.gca().get_legend_handles_labels()
             by_label = dict(zip(labels, handles))
             plt.legend(by_label.values(), by_label.keys(), loc='best', fontsize=10)
-            
-            # img = mpimg.imread(Path(self.filepath, "input_image_0.png"))
-            # plt.imshow(img)
-            # plt.grid(alpha=0.3)
-            # plt.gca().invert_yaxis()
             
             # Save figure if required
             if self.args.is_save:
@@ -634,13 +551,7 @@ class OSMConnection:
 
         return lane_id_mapping
 
-    def extract_osm(
-            self,
-            detected_points,
-            sumo_lane_geometries,
-            sumo_df,
-            camera_loc
-        ):
+    def extract_osm(self, detected_points, sumo_df, camera_loc):
         """Detected points are center points detected from LaneContinousLearning
 
         Args:
@@ -649,17 +560,6 @@ class OSMConnection:
             sumo_df [DataFrame]: lane id dataframe from SUMO
             camera_loc [str]: camera location
         """
-        # Extract OSM data
-        # sumo_points = [point for points in sumo_lane_geometries.values() for point in points]
-        # sumo_tree = cKDTree(detected_points)
-        # sumo_points = self.sumo_to_global(sumo_points, camera_loc)
-
-        # # Match detected points to SUMO lanes and calculate distance
-        # matches = sumo_tree.query(detected_points, k=1) # Find nearest SUMO point for each detected point
-        # for i, (dist, idx) in enumerate(zip(*matches)):
-        #     print(f"Detected lane {i} matched to SUMO point {sumo_points[idx]} and calibrated points {detected_points[idx]} with distance {dist:.6f}")
-        #     logger.debug(f"Detected lane {i} matched to SUMO point {sumo_points[idx]} and calibrated points {detected_points[idx]} with distance {dist:.6f}")
-
         detected_points = self.gps_to_sumo(detected_points, camera_loc)
 
         sumo_edges = [np.array(coord) for coord in sumo_df.get_column('Coordinates')]
@@ -672,7 +572,7 @@ class OSMConnection:
         # print("interpolated_edges", interpolated_edges)
         group_dict = {g: sumo_df.filter(sumo_df["Group ID"] == g)["index"].to_list() for g in group_id.unique()}
 
-        # Step 1: Cluster red points using DBSCAN
+        # Cluster red points using DBSCAN
         # eps: The maximum distance between two samples for one to be considered as in the neighborhood of the other.
         # Detected points should be differed from each other
         dbscan = DBSCAN(eps=2, min_samples=1)
@@ -708,13 +608,11 @@ class OSMConnection:
                 ax.scatter(cluster_points[:, 0], cluster_points[:, 1], label=label, color=colors[cluster_to_edge_map.get(cluster_id, "N/A")[1]])
                 ax.text(cluster_points[0, 0], cluster_points[0, 1], label)
 
-            # plt.legend()
             ax.set_xlabel('X Coordinate')
             ax.set_ylabel('Y Coordinate')
             ax.set_title('Cluster Detected Points and Assign to Edges')
-            # plt.show()
             fig.tight_layout()
-            fig.savefig(Path(self.filepath, camera_loc, 'cluster_detected_points.png'))
+            fig.savefig(Path(self.filepath, camera_loc, 'sumo', 'cluster_detected_points.png'))
             plt.close(fig)
 
         return interpolated_coords, cluster_to_edge_map
@@ -729,13 +627,11 @@ class OSMConnection:
         logger.info(f"Extract lane from OSM at {camera_loc}...")
         self.trial = trial
 
-        # sumo_nodes = self.osm_connection.get_nodes(camera_loc)
-        sumo_lane_geometries = self.get_edges(camera_loc)
         lane_geometries, lane_edge_geometries, grouped_lane_edge_geometries, lane_id_list, lane_shape = self.get_net(camera_loc)
         
         sumo_df = self.get_lane_id_sumo(lane_edge_geometries, grouped_lane_edge_geometries)
         sumo_points, cluster_to_edge_map = self.extract_osm(
-            detected_centers, sumo_lane_geometries, sumo_df, camera_loc
+            detected_centers, sumo_df, camera_loc
         )
         sumo_gps_points = [self.sumo_to_global(sp, camera_loc) for sp in sumo_points]
         return sumo_gps_points, cluster_to_edge_map, lane_shape

@@ -176,14 +176,16 @@ def process_camera_data(data_pipeline, osm_connection, camera_loc, c_epoch, fram
         logger.error(f"Error processing camera data for {camera_loc} at epoch {c_epoch}: {e}")
         raise
 
-def continuous_process(args, c_epoch, data_queue, stop_event, saving_file_path, camera_loc_list, barrier):
+def continuous_process(args, c_epoch, data_queue, stop_event, saving_path, camera_loc_list, barrier):
     """
     Continuous data collection process
     """
     logger.info("[Continuous Process] Started")
 
     try:
-        lane_detection = LaneContinuousProcess(args, saving_file_path, camera_loc_list)
+        saving_file_path = Path(saving_path, args.model)
+
+        lane_detection = LaneContinuousProcess(args, saving_path, camera_loc_list)
         data_pipeline = OrbitDataPipeline(args, saving_file_path)
         osm_connection = OSMConnection(args, saving_file_path)
         
@@ -289,32 +291,6 @@ def geometric_learning(pipeline, g_epoch, data_queue, stop_event, barrier):
             if epoch >= 10:
                 pipeline.switch_to_deployment()
 
-            # if epoch == 10:
-            #     for camera_loc, processed_data in preprocessed_by_camera.items():
-            #         try:
-            #             geo_learning = pipeline.geo_learning_instances[camera_loc]
-            #             traj_df, lane_boundaries = geo_learning.run(
-            #                 c_epoch=c_epoch,
-            #                 g_epoch=epoch,
-            #                 traj_df=processed_data.get('gps_df', None),
-            #                 camera_loc=camera_loc,
-            #                 trial='0',
-            #                 is_save=False
-            #             )
-
-            #             # Assign vehicles to detected lanes with the best model
-            #             _ = lane_processor.assign_vehicles_to_detected_lanes(
-            #                 traj_df=processed_data.get('gps_df', None),
-            #                 lane_boundaries_for_contour=lane_boundaries,
-            #                 pixel_hom=processed_data.get('pixel_hom', None),
-            #                 camera_loc=camera_loc,
-            #                 epoch=epoch
-            #             )
-            #             logger.info(f"Update trajectory CSV with lane assignments for {camera_loc}")
-            #         except Exception as e:
-            #             logger.error(f"Error in lane assignment for {camera_loc}: {e}")
-            #             traceback.print_exc()
-            
             time.sleep(0.1)
     
     except Exception as e:

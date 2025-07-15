@@ -5,7 +5,7 @@ dataset/
 runs/
 mlruns/
 results/*
-!results/*/preprocess
+!results/preprocess
 
 logs/*.log
 *.zip

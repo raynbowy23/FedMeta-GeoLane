@@ -42,12 +42,7 @@ class OrbitDataPipeline:
         binary_heatmap_area, detected_vehs = create_binary_image_utils(c_epoch, collect_cars, frame, fig_filepath, self.is_save)
         return binary_heatmap_area, detected_vehs
 
-    def generate_contour(
-            self,
-            camera_loc,
-            frame,
-            binary_heatmap_area
-        ):
+    def generate_contour(self, camera_loc, frame, binary_heatmap_area):
         """ generate valid road contour based on generated binary image in the last step
 
         Args:
