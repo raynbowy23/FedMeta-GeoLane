@@ -80,7 +80,8 @@ class GeometricLearningPipeline:
         aggregated = self.learning_system.aggregate_client_updates(client_results)
         
         # Train models
-        self.learning_system.train_models(g_epoch)
+        # self.learning_system.train_models(g_epoch)
+        self.learning_system.train_models(selected_clients, local_epochs=1, lr=1e-3)
         
         logger.info(f"Epoch {g_epoch} - Avg Loss: {aggregated['avg_loss']:.4f} "
                    f"(±{aggregated.get('std_loss', 0):.4f}), "

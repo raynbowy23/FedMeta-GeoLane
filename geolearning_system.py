@@ -283,7 +283,7 @@ class GeoLearningSystem:
             **aggregated_loss_components
         }
     
-    def train_models(self, epoch):
+    def train_models(self, selected_clients=None, local_epochs=10, lr=1e-3):
         """
         Train models based on strategy
         """
@@ -291,8 +291,9 @@ class GeoLearningSystem:
             self._train_meta_models()
         elif self.strategy == 'federated' and self.training_mode:
             logger.info("Training federated meta-model...")
-            self.fed_learner.train_meta_model(num_epochs=20)
-    
+            # self.fed_learner.train_meta_model(num_epochs=20)
+            self.fed_learner.train_models(selected_clients=selected_clients, local_epochs=local_epochs, lr=lr)
+
     def _train_meta_models(self):
         """Train individual meta-models for meta-learning strategy"""
         selected_clients = ['US12_Todd', 'US12_Monona', 'US12_Yahara']
