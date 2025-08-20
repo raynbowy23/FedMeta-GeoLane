@@ -41,10 +41,12 @@ git clone https://github.com/raynbowy23/FedMeta-GeoLane.git
 cd FedMeta-GeoLane
 ```
 
-Create conda environment with Python >= 3.10. 
+Create uv environment with Python >= 3.10. 
 ```bash
-conda create -n lane_detection Python3.10
-conda activate lane_detection
+uv init
+uv sync
+# Linux
+source .venv/bin/activate
 ```
 
 Install dependencies
