@@ -66,6 +66,7 @@ class MetaMLModel(nn.Module):
             'consistency_weight': nn.Linear(hidden_dim, 1),
             'triplet_margin': nn.Linear(hidden_dim, 1),
             'smoothing_factor': nn.Linear(hidden_dim, 1),
+            'peak_prominence': nn.Linear(hidden_dim, 1),
         })
 
         # Learnable loss weights
@@ -116,6 +117,11 @@ class MetaMLModel(nn.Module):
             elif param_name == 'smoothing_factor':
                 # Smoothing factor typically 1-20
                 theta_dict[param_name] = torch.sigmoid(head(features)).squeeze() * 19 + 1
+            elif param_name == 'peak_prominence':
+                # Histogram peak salience for lane counting, range ~0.3-3.0.
+                # The meta-learner lowers it for sparse scenes to recover
+                # low-traffic lanes and raises it to reject spurious peaks.
+                theta_dict[param_name] = torch.sigmoid(head(features)).squeeze() * 2.7 + 0.3
             else:
                 # Others typically 0-1
                 theta_dict[param_name] = torch.sigmoid(head(features)).squeeze()
@@ -253,6 +259,12 @@ class FederatedMetaLearner:
                         perturbed_theta[k] = max(1, min(20, v + noise * 10))
                     elif k == 'triplet_margin':
                         perturbed_theta[k] = max(0.1, min(2.0, v + noise))
+                    elif k == 'peak_prominence':
+                        # Wide exploration: the useful value can sit far from the
+                        # initial prediction (sparse scenes need LOW prominence to
+                        # recover small lane peaks), so sample across the full range
+                        # instead of a local step the black-box search can't escape.
+                        perturbed_theta[k] = float(np.random.uniform(0.3, 3.0))
                     else:
                         perturbed_theta[k] = max(0.1, min(1.0, v + noise))
                 

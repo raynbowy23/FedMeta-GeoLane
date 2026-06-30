@@ -57,6 +57,7 @@ class GeoLearningSystem:
             'triplet_margin': torch.tensor(0.8),
             'smoothing_factor': torch.tensor(10.0),
             'edge_trim_ratio': torch.tensor(0.1),
+            'peak_prominence': torch.tensor(1.0),
             'weight_lane_count': torch.tensor(1.0),
             'weight_consistency': torch.tensor(1.0),
             'weight_triplet': torch.tensor(1.0),
@@ -359,11 +360,15 @@ class GeoLearningSystem:
         """Select clients based on strategy and training mode"""
         if self.strategy == 'federated':
             if self.training_mode:
-                return ['US12_Todd', 'US12_Monona', 'US12_Yahara']
-                # return ['US12_Todd', 'US12_Monona', 'US12_Yahara', 'US12_Stoughton', 
-                #        'US12_Whitney', 'US12_JohnNolen', 'US12_Park']
+                # return ['US12_Todd', 'US12_Monona', 'US12_Yahara']
+                # return ['US12_Todd', 'US12_Monona', 'US12_Yahara', 'US12_Stoughton']
+                return ['US12_Todd', 'US12_Monona', 'US12_Yahara', 'US12_Stoughton', 
+                       'US12_Whitney']
             else:
-                return ['US12_Todd', 'US12_Monona', 'US12_Yahara', 'US12_Park']
+                # return ['US12_Todd', 'US12_Monona', 'US12_Yahara', 'US12_Park']
+                # return ['US12_Todd', 'US12_Monona', 'US12_Yahara', 'US12_Park', 'US12_Stoughton']
+                return ['US12_Todd', 'US12_Monona', 'US12_Yahara', 'US12_Stoughton', 
+                       'US12_Whitney', 'US12_JohnNolen', 'US12_Park']
         elif self.strategy == 'meta':
             if self.training_mode:
                 return ['US12_Todd', 'US12_Monona', 'US12_Yahara']

@@ -40,6 +40,7 @@ class GeometricLearning:
             'triplet_margin': torch.tensor(0.8),
             'smoothing_factor': torch.tensor(10.0),
             'sigma': torch.tensor(2.0),
+            'peak_prominence': torch.tensor(1.0),
         }
 
         self.colors = [
@@ -221,15 +222,16 @@ class GeometricLearning:
             else:
                 smoothed_hist = self.gaussian_filter(hist_vals, window_size=5, sigma=2)
 
-            # Adaptive peak detection based on theta
-            # if 'angle_penalty' in self.theta:
-            #     angle_val = self.theta['angle_penalty'].item() if isinstance(self.theta['angle_penalty'], torch.Tensor) else self.theta['angle_penalty']
-            #     # Adjust peak detection sensitivity based on angle penalty
-            #     prominence = 1 + angle_val  # Higher angle penalty = more strict peak detection
-            #     peaks, _ = find_peaks(smoothed_hist, height=1, distance=3, prominence=prominence)
-            # else:
-            #     peaks, _ = find_peaks(smoothed_hist, height=1, distance=3, prominence=1)
-            peaks, _ = find_peaks(smoothed_hist, height=1, distance=3, prominence=1)
+            # Adaptive peak detection: meta-learned peak salience (theta_prominence).
+            # Lower values recover small peaks from sparse / low-traffic lanes;
+            # higher values suppress spurious peaks in busy or noisy scenes.
+            prominence = self.theta.get('peak_prominence', torch.tensor(1.0))
+            if isinstance(prominence, torch.Tensor):
+                prominence = prominence.item()
+            # Use the same salience floor for height so that genuine peaks
+            # attenuated by Gaussian smoothing are not pre-filtered by the
+            # height gate before the prominence test is applied.
+            peaks, _ = find_peaks(smoothed_hist, height=prominence, distance=3, prominence=prominence)
             n_lanes = len(peaks)
 
             logger.info(f"Estimated number of lanes: {n_lanes}")
