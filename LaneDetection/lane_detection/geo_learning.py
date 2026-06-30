@@ -462,6 +462,7 @@ class GeometricLearning:
         l_trip = l_trip / max(1, num_triplets)
 
         # Geometry loss: width + length comparison
+        raw_width_m = float('nan')
         if sumo_lane_shape is not None and cluster_to_edge_map is not None:
             detected_length_list = []
             # detected_length = torch.zeros(lane_num, device=device, requires_grad=True)
@@ -509,6 +510,12 @@ class GeometricLearning:
             # l_geo = (width_term + length_term) / lane_num
             l_geo = width_term
 
+            # Raw, unweighted mean absolute width error in meters (model-independent
+            # reporting metric). NOTE: reference is still the nominal 3.2 m constant
+            # used by the loss above; switching to a per-lane SUMO reference is the
+            # separate "hard-coded 3.2 m" fix and also depends on width_scale.
+            raw_width_m = float(torch.mean(torch.abs(detected_width - sumo_width)).item())
+
 
         weight_lane = self.theta.get('weight_lane_count', torch.tensor(1.0))
         weight_cons = self.theta.get('weight_consistency', torch.tensor(1.0))
@@ -529,4 +536,35 @@ class GeometricLearning:
         l_total = (weight_lane * l_lane_count * 10 + weight_cons * l_cons + \
                     weight_trip * l_trip + weight_geo * l_geo)
 
-        return l_total, l_lane_count, l_cons, l_trip, l_geo
+        # ---- Model-independent geometric metrics (meters), free of learned weights ----
+        # Reported for fair cross-model comparison (Table 1). Unlike l_cons (scaled by
+        # the learned consistency_weight), l_trip (a margin-offset triplet) and l_total
+        # (baseline weights sum to 4 vs. meta's softmax weights sum to 1), these raw
+        # quantities are computed identically for every model.
+        if l_cons_list:
+            raw_consistency_m = float(torch.stack(l_cons_list).mean().item())
+        else:
+            raw_consistency_m = float('nan')
+
+        dev_list = []
+        for lane in range(lane_num):
+            P = detected_center_list[lane]
+            Q = sumo_lanes[lane]
+            if P.shape[0] > 0 and Q.shape[0] > 0:
+                D = gps_pairwise_distance(P, Q)  # (m, n) in meters
+                dev_list.append(D.min(dim=1).values.mean())
+        raw_centerline_m = float(torch.stack(dev_list).mean().item()) if dev_list else float('nan')
+
+        comps = [raw_consistency_m, raw_centerline_m, raw_width_m]
+        geo_total_m = float(np.nansum(comps)) if any(not np.isnan(c) for c in comps) else float('nan')
+
+        raw_metrics = {
+            'geo_consistency_m': raw_consistency_m,  # mean Frechet distance to reference centerline
+            'geo_centerline_m': raw_centerline_m,    # mean nearest-point centerline deviation
+            'geo_width_m': raw_width_m,              # mean |detected - reference| lane width
+            'geo_total_m': geo_total_m,              # equal-weight sum of the three (all meters)
+            'lane_count_err': float(l_lane_count),   # |N_det - N_ref|
+            'lane_count_exact': 1.0 if l_lane_count == 0 else 0.0,  # exact match -> accuracy %
+        }
+
+        return l_total, l_lane_count, l_cons, l_trip, l_geo, raw_metrics

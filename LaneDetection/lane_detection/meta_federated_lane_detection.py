@@ -470,11 +470,11 @@ class FederatedMetaLearner:
                 detected_center_tensor = torch.tensor(np.array(detected_center_list), dtype=torch.float32)
                 
                 # Compute loss using geo_learning's compute_loss method
-                l_total, l_lane_count, l_cons, l_trip, l_geo = geo_learning.compute_loss(
-                    detected_center_tensor, 
-                    sumo_center_tensor, 
-                    lane_width_list, 
-                    lane_shape, 
+                l_total, l_lane_count, l_cons, l_trip, l_geo, raw_metrics = geo_learning.compute_loss(
+                    detected_center_tensor,
+                    sumo_center_tensor,
+                    lane_width_list,
+                    lane_shape,
                     cluster_to_edge_map
                 )
 
@@ -492,12 +492,17 @@ class FederatedMetaLearner:
                     'sumo_lanes': len(sumo_center_tensor) if sumo_center_tensor[0].shape[0] > 0 else 0
                 }
 
+                metrics.update(raw_metrics)
+
                 logger.info(f"Client {client_id} - Total Loss: {total_loss:.4f}, "
                           f"Lane Count Loss: {metrics['l_lane_count']:.4f}, "
                           f"Consistency Loss: {metrics['l_cons']:.4f}, "
                           f"Triplet Loss: {metrics['l_trip']:.4f}, "
                           f"Geometry Loss: {metrics['l_geo']:.4f}")
-                
+                logger.info(f"Client {client_id} - [raw m] consistency={raw_metrics['geo_consistency_m']:.3f}, "
+                          f"centerline={raw_metrics['geo_centerline_m']:.3f}, width={raw_metrics['geo_width_m']:.3f}, "
+                          f"geo_total={raw_metrics['geo_total_m']:.3f}, lane_count_err={raw_metrics['lane_count_err']:.0f}")
+
                 return total_loss, metrics
                 
             else:
@@ -625,7 +630,9 @@ class FederatedMetaLearner:
         We take FedAvg approach.
         """
         aggregated_metrics = defaultdict(list)
-        loss_component_keys = ['l_lane_count', 'l_cons', 'l_trip', 'l_geo']
+        loss_component_keys = ['l_lane_count', 'l_cons', 'l_trip', 'l_geo',
+                               'geo_consistency_m', 'geo_centerline_m', 'geo_width_m',
+                               'geo_total_m', 'lane_count_err', 'lane_count_exact']
         client_thetas = []
         
         for client_id, (loss, theta, metrics) in client_results.items():
@@ -638,11 +645,12 @@ class FederatedMetaLearner:
         avg_loss = np.mean(aggregated_metrics['losses'])
         std_loss = np.std(aggregated_metrics['losses'])
 
-        # Compute average of each metric starting with 'l_'
+        # Average the reported components (incl. model-independent raw metrics).
+        # nanmean so a client with no matched lanes (nan) doesn't void the average.
         avg_metrics = {
-            k: float(np.mean(v_list))
-            for k, v_list in aggregated_metrics.items()
-            if k.startswith("l_")
+            k: float(np.nanmean(aggregated_metrics[k]))
+            for k in loss_component_keys
+            if k in aggregated_metrics and len(aggregated_metrics[k]) > 0
         }
 
         # Average theta parameters
@@ -656,10 +664,11 @@ class FederatedMetaLearner:
             for client_id, (loss, theta, metrics) in client_results.items():
                 mlflow.log_metric(f"Federated/Loss_{client_id}", loss, step=self.round_counter)
                 
-                # Log detailed loss components per client
+                # Log detailed loss components per client (incl. raw model-independent metrics)
                 for key in loss_component_keys:
-                    if key in metrics:
-                        mlflow.log_metric(f"Federated/{key}_{client_id}", metrics[key], step=self.round_counter)
+                    val = metrics.get(key)
+                    if val is not None and not (isinstance(val, float) and np.isnan(val)):
+                        mlflow.log_metric(f"Federated/{key}_{client_id}", val, step=self.round_counter)
                         
         except ImportError:
             logger.warning("MLflow not available for detailed logging")

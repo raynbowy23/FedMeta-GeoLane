@@ -70,11 +70,11 @@ def compute_loss_for_baseline(geo_learning, traj_df, lane_boundaries_for_contour
             detected_center_tensor = torch.tensor(np.array(detected_center_list), dtype=torch.float32)
             
             # Compute loss using geo_learning's compute_loss method
-            l_total, l_lane_count, l_cons, l_trip, l_geo = geo_learning.compute_loss(
-                detected_center_tensor, 
-                sumo_center_tensor, 
-                lane_width_list, 
-                lane_shape, 
+            l_total, l_lane_count, l_cons, l_trip, l_geo, raw_metrics = geo_learning.compute_loss(
+                detected_center_tensor,
+                sumo_center_tensor,
+                lane_width_list,
+                lane_shape,
                 cluster_to_edge_map
             )
             
@@ -92,12 +92,17 @@ def compute_loss_for_baseline(geo_learning, traj_df, lane_boundaries_for_contour
                 'sumo_lanes': len(sumo_center_tensor) if sumo_center_tensor and sumo_center_tensor[0].shape[0] > 0 else 0
             }
 
+            metrics.update(raw_metrics)
+
             logger.info(f"Client {client_id} - Total Loss: {total_loss:.4f}, "
                         f"Lane Count Loss: {metrics['l_lane_count']:.4f}, "
                         f"Consistency Loss: {metrics['l_cons']:.4f}, "
                         f"Triplet Loss: {metrics['l_trip']:.4f}, "
                         f"Geometry Loss: {metrics['l_geo']:.4f}")
-            
+            logger.info(f"Client {client_id} - [raw m] consistency={raw_metrics['geo_consistency_m']:.3f}, "
+                        f"centerline={raw_metrics['geo_centerline_m']:.3f}, width={raw_metrics['geo_width_m']:.3f}, "
+                        f"geo_total={raw_metrics['geo_total_m']:.3f}, lane_count_err={raw_metrics['lane_count_err']:.0f}")
+
             return total_loss, metrics
             
         else:

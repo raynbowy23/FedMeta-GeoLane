@@ -220,10 +220,13 @@ class GeoLearningSystem:
             for client_id, (loss, theta, metrics) in client_results.items():
                 mlflow.log_metric(f"Baseline/Loss_{client_id}", loss, step=self.round_counter)
                 
-                # Log detailed loss components per client
-                for key in loss_component_keys:
-                    if key in metrics:
-                        mlflow.log_metric(f"Baseline/{key}_{client_id}", metrics[key], step=self.round_counter)
+                # Log detailed loss components per client (incl. model-independent raw metrics)
+                for key in loss_component_keys + ['geo_consistency_m', 'geo_centerline_m',
+                                                  'geo_width_m', 'geo_total_m',
+                                                  'lane_count_err', 'lane_count_exact']:
+                    val = metrics.get(key)
+                    if val is not None and not (isinstance(val, float) and np.isnan(val)):
+                        mlflow.log_metric(f"Baseline/{key}_{client_id}", val, step=self.round_counter)
                         
         except ImportError:
             logger.warning("MLflow not available for detailed logging")
@@ -259,10 +262,13 @@ class GeoLearningSystem:
                 mlflow.log_metric(f"Meta/Loss_{client_id}", loss, step=self.round_counter)
                 mlflow.log_metric(f"Meta/BPS_{client_id}", metrics.get('bps', 0), step=self.round_counter)
                 
-                # Log detailed loss components per client
-                for key in loss_component_keys:
-                    if key in metrics:
-                        mlflow.log_metric(f"Meta/{key}_{client_id}", metrics[key], step=self.round_counter)
+                # Log detailed loss components per client (incl. model-independent raw metrics)
+                for key in loss_component_keys + ['geo_consistency_m', 'geo_centerline_m',
+                                                  'geo_width_m', 'geo_total_m',
+                                                  'lane_count_err', 'lane_count_exact']:
+                    val = metrics.get(key)
+                    if val is not None and not (isinstance(val, float) and np.isnan(val)):
+                        mlflow.log_metric(f"Meta/{key}_{client_id}", val, step=self.round_counter)
                 
                 # Log predicted theta parameters for meta-learning
                 if isinstance(theta, dict):
