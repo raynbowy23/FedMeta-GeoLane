@@ -19,6 +19,18 @@ from LaneDetection.lane_detection.meta_federated_lane_detection import (
 logger = logging.getLogger(__name__)
 
 
+# Single train/test camera split, shared by all strategies (baseline/meta/federated)
+# so Table 1 compares them on the SAME seen/unseen cameras. To change the split,
+# edit only these two lists. A camera is used only if it also has preprocessed data
+# that round (select_clients intersects with available_clients), so listing one that
+# isn't set up yet is safely skipped and logged.
+SEEN_CLIENTS = [
+    'US12_Todd', 'US12_Monona', 'US12_Yahara', 'US12_Stoughton', 'US12_Whitney',
+    'US12_Mineral', 'US12_University', 'US12_CountyAB',
+]
+UNSEEN_CLIENTS = ['US12_JohnNolen', 'US12_Park']
+
+
 class GeoLearningSystem:
     """
     GeoLearning system that handles all learning strategies through a single interface.
@@ -303,8 +315,8 @@ class GeoLearningSystem:
 
     def _train_meta_models(self):
         """Train individual meta-models for meta-learning strategy"""
-        selected_clients = ['US12_Todd', 'US12_Monona', 'US12_Yahara']
-        
+        selected_clients = SEEN_CLIENTS
+
         for client_id in selected_clients:
             if len(self.client_data_buffer[client_id]) >= 10:
                 self._train_individual_meta_model(client_id)
@@ -363,25 +375,25 @@ class GeoLearningSystem:
                 f"Improvement: {((epoch_losses[0] - epoch_losses[-1]) / epoch_losses[0] * 100):.1f}%")
     
     def select_clients(self, available_clients):
-        """Select clients based on strategy and training mode"""
-        if self.strategy == 'federated':
-            if self.training_mode:
-                # return ['US12_Todd', 'US12_Monona', 'US12_Yahara']
-                # return ['US12_Todd', 'US12_Monona', 'US12_Yahara', 'US12_Stoughton']
-                return ['US12_Todd', 'US12_Monona', 'US12_Yahara', 'US12_Stoughton', 
-                       'US12_Whitney']
-            else:
-                # return ['US12_Todd', 'US12_Monona', 'US12_Yahara', 'US12_Park']
-                # return ['US12_Todd', 'US12_Monona', 'US12_Yahara', 'US12_Park', 'US12_Stoughton']
-                return ['US12_Todd', 'US12_Monona', 'US12_Yahara', 'US12_Stoughton', 
-                       'US12_Whitney', 'US12_JohnNolen', 'US12_Park']
-        elif self.strategy == 'meta':
-            if self.training_mode:
-                return ['US12_Todd', 'US12_Monona', 'US12_Yahara']
-            else:
-                return ['US12_Todd', 'US12_Monona', 'US12_Yahara', 'US12_Park']
-        else: # Baseline
-            return available_clients
+        """Select clients for the current mode.
+
+        All strategies share one seen/unseen split (SEEN_CLIENTS / UNSEEN_CLIENTS)
+        so Baseline, Meta, and FedMeta are evaluated on identical cameras. Training
+        uses the seen set; deployment adds the held-out unseen set. Only cameras that
+        also have preprocessed data this round (available_clients) are returned.
+        """
+        seen = [c for c in SEEN_CLIENTS if c in available_clients]
+        unseen = [c for c in UNSEEN_CLIENTS if c in available_clients]
+        selected = seen if self.training_mode else seen + unseen
+
+        missing = [c for c in (SEEN_CLIENTS if self.training_mode else SEEN_CLIENTS + UNSEEN_CLIENTS)
+                   if c not in available_clients]
+        if missing:
+            logger.warning(f"[{self.strategy}] split cameras with no data this round (skipped): {missing}")
+        if not selected:
+            logger.warning(f"[{self.strategy}] no split cameras available; falling back to all: {list(available_clients)}")
+            return list(available_clients)
+        return selected
     
     def switch_to_deployment(self):
         """Switch to deployment mode"""

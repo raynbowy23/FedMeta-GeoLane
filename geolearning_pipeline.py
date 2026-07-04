@@ -203,6 +203,13 @@ def continuous_process(args, c_epoch, data_queue, stop_event, saving_path, camer
             preprocessed_by_camera = {}
 
             for camera_loc, data in data_by_camera.items():
+                # Skip cameras whose SUMO net isn't set up yet (locations listed in
+                # camera_location_list.txt but not prepared) instead of crashing the run.
+                net_file = Path(args.osm_path, camera_loc, "osm.net.xml")
+                if not net_file.exists():
+                    logger.warning(f"[Continuous Process] Skipping {camera_loc}: SUMO net not found at {net_file}")
+                    continue
+
                 # Process data for each camera
                 result = process_camera_data(
                     data_pipeline,

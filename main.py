@@ -31,7 +31,7 @@ parser.add_argument('--T', type=int, default=60, help='Time interval of each cyc
 parser.add_argument('--is_save', action='store_true', help='Save the results or not')
 parser.add_argument('--conf_thre', type=float, default='0.25', help='Detection confidence score threshold when creating '
                                                                     'the road segment')
-parser.add_argument('--osm_path', type=str, default="./LaneDetection/osm_extraction/", help='The path of the OSM file to extract data from')
+parser.add_argument('--osm_path', type=str, default="./dataset/sumo/", help='Directory holding per-camera SUMO/OSM exports (<camera>/osm.net.xml)')
 parser.add_argument('--model', type=str, default='federated', help='Model type: federated, baseline, meta')
 parser.add_argument('--use_historical_data', action='store_true', help='Use historical data or not')
 parser.add_argument('--skip_continuous_learning', action='store_true', help='Skip continuous learning or not')
