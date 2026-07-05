@@ -80,8 +80,9 @@ class OSMConnection:
                 shape = lane.get('shape')
                 # length = lane.get('length')
                 length = self.compute_polyline_length(shape, camera_loc)
-                # TODO: Update the width of the lane by lane type, default is 3.2m
-                lane_shape[lane_id] = (length, 3.2)
+                # Real per-lane width from the net when present; SUMO's default is 3.2 m
+                # for driving lanes, so absent attributes fall back to that.
+                lane_shape[lane_id] = (length, float(lane.get('width', 3.2)))
                 # Convert shape to list of coordinates
                 points = [tuple(map(np.float64, p.split(','))) for p in shape.split()]
                 lane_edge_geometries[lane_id] = points

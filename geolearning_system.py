@@ -253,7 +253,7 @@ class GeoLearningSystem:
                 mlflow.log_metric(f"Baseline/Loss_{client_id}", loss, step=self.round_counter)
                 
                 # Log detailed loss components per client (incl. model-independent raw metrics)
-                for key in loss_component_keys + ['geo_consistency_m', 'geo_centerline_m',
+                for key in loss_component_keys + ['geo_consistency_m', 'geo_coverage_m', 'geo_centerline_m',
                                                   'geo_width_m', 'geo_total_m',
                                                   'lane_count_err', 'lane_count_exact']:
                     val = metrics.get(key)
@@ -295,7 +295,7 @@ class GeoLearningSystem:
                 mlflow.log_metric(f"Meta/BPS_{client_id}", metrics.get('bps', 0), step=self.round_counter)
                 
                 # Log detailed loss components per client (incl. model-independent raw metrics)
-                for key in loss_component_keys + ['geo_consistency_m', 'geo_centerline_m',
+                for key in loss_component_keys + ['geo_consistency_m', 'geo_coverage_m', 'geo_centerline_m',
                                                   'geo_width_m', 'geo_total_m',
                                                   'lane_count_err', 'lane_count_exact']:
                     val = metrics.get(key)

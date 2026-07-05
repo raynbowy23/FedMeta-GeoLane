@@ -32,7 +32,7 @@ parser.add_argument('--is_save', action='store_true', help='Save the results or 
 parser.add_argument('--conf_thre', type=float, default='0.25', help='Detection confidence score threshold when creating '
                                                                     'the road segment')
 parser.add_argument('--osm_path', type=str, default="./dataset/sumo/", help='Directory holding per-camera SUMO/OSM exports (<camera>/osm.net.xml)')
-parser.add_argument('--model', type=str, default='federated', help='Model type: federated, baseline, meta')
+parser.add_argument('--model', type=str, default='federated', choices=['federated', 'baseline', 'meta'], help='Model type: federated, baseline, meta')
 parser.add_argument('--use_historical_data', action='store_true', help='Use historical data or not')
 parser.add_argument('--skip_continuous_learning', action='store_true', help='Skip continuous learning or not')
 parser.add_argument('--lambda_thres', type=int, default='120', help='Criteria of stopping the cycle learning')

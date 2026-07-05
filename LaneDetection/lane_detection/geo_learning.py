@@ -518,8 +518,15 @@ class GeometricLearning:
                 dw.to(device) if isinstance(dw, torch.Tensor) else torch.tensor(dw, dtype=torch.float32, device=device)
                 for dw in detected_width
             ]
-            sumo_width = torch.full((len(detected_width),len(detected_width[0])), 3.2)
             detected_width = torch.stack(detected_width) if detected_width else torch.zeros(lane_num, device=device)
+
+            # Per-lane reference widths from the SUMO net (Eq. 6's map-derived c_mw).
+            # Unmatched lanes (sumo_width_list left at 0.0) fall back to the 3.2 m default.
+            ref_widths = torch.stack([
+                w if float(w) > 0 else torch.tensor(3.2, device=device)
+                for w in sumo_width_list
+            ])
+            sumo_width = ref_widths.unsqueeze(1).expand(lane_num, detected_width.shape[1])
 
             width_errors = torch.stack([
                 torch.mean((sumo_width[i] - detected_width[i]) ** 2)
@@ -531,11 +538,14 @@ class GeometricLearning:
             # l_geo = (width_term + length_term) / lane_num
             l_geo = width_term
 
-            # Raw, unweighted mean absolute width error in meters (model-independent
-            # reporting metric). NOTE: reference is still the nominal 3.2 m constant
-            # used by the loss above; switching to a per-lane SUMO reference is the
-            # separate "hard-coded 3.2 m" fix and also depends on width_scale.
-            raw_width_m = float(torch.mean(torch.abs(detected_width - sumo_width)).item())
+            # Raw, unweighted mean absolute width error in meters against the real
+            # per-lane SUMO reference. The learnable width_scale is divided back out
+            # so the metric measures the trajectory-derived width estimate itself and
+            # stays comparable across models with different learned scales.
+            ws = self.theta.get('width_scale', 1.0)
+            ws = float(ws.item()) if isinstance(ws, torch.Tensor) else float(ws)
+            unscaled_width = detected_width / ws if ws > 0 else detected_width
+            raw_width_m = float(torch.mean(torch.abs(unscaled_width - sumo_width)).item())
 
 
         weight_lane = self.theta.get('weight_lane_count', torch.tensor(1.0))
@@ -576,11 +586,30 @@ class GeometricLearning:
                 dev_list.append(D.min(dim=1).values.mean())
         raw_centerline_m = float(torch.stack(dev_list).mean().item()) if dev_list else float('nan')
 
-        comps = [raw_consistency_m, raw_centerline_m, raw_width_m]
+        # Recall direction: how far is each reference SUMO lane from its nearest
+        # DETECTED lane. Centerline/consistency above only score the lanes a model
+        # chose to detect, so a model that skips hard lanes is never charged for
+        # them; coverage is where a missed lane shows up.
+        cov_list = []
+        for Q in sumo_center_list:
+            if Q.shape[0] == 0:
+                continue
+            per_detected = []
+            for lane in range(lane_num):
+                P = detected_center_list[lane]
+                if P.shape[0] > 0:
+                    D = gps_pairwise_distance(Q, P)  # (points_Q, points_P) in meters
+                    per_detected.append(D.min(dim=1).values.mean())
+            if per_detected:
+                cov_list.append(torch.stack(per_detected).min())
+        raw_coverage_m = float(torch.stack(cov_list).mean().item()) if cov_list else float('nan')
+
+        comps = [raw_consistency_m, raw_centerline_m, raw_width_m, raw_coverage_m]
         geo_total_m = float(np.nansum(comps)) if any(not np.isnan(c) for c in comps) else float('nan')
 
         raw_metrics = {
             'geo_consistency_m': raw_consistency_m,  # mean Frechet distance to reference centerline
+            'geo_coverage_m': raw_coverage_m,        # mean reference-lane distance to nearest detected lane (recall)
             'geo_centerline_m': raw_centerline_m,    # mean nearest-point centerline deviation
             'geo_width_m': raw_width_m,              # mean |detected - reference| lane width
             'geo_total_m': geo_total_m,              # equal-weight sum of the three (all meters)

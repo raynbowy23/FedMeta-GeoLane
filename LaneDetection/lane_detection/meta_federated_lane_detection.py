@@ -615,7 +615,7 @@ class FederatedMetaLearner:
         """
         aggregated_metrics = defaultdict(list)
         loss_component_keys = ['l_lane_count', 'l_cons', 'l_trip', 'l_geo',
-                               'geo_consistency_m', 'geo_centerline_m', 'geo_width_m',
+                               'geo_consistency_m', 'geo_coverage_m', 'geo_centerline_m', 'geo_width_m',
                                'geo_total_m', 'lane_count_err', 'lane_count_exact']
         client_thetas = []
         
