@@ -150,6 +150,20 @@ class GeoLearningSystem:
         
         return loss, self.fixed_theta, metrics
     
+    def _nearest_trained_client(self, scene_features):
+        """Seen client whose buffered scene features are closest (L2) to the given scene."""
+        target = scene_features.squeeze().detach().cpu()
+        best_id, best_d = None, float('inf')
+        for cid in SEEN_CLIENTS:
+            buf = self.client_data_buffer.get(cid, [])
+            if not buf:
+                continue
+            feats = torch.stack([b['scene_features'].squeeze() for b in buf]).mean(dim=0)
+            d = float(torch.norm(feats - target))
+            if d < best_d:
+                best_d, best_id = d, cid
+        return best_id
+
     def _meta_client_update(self, client_id, processed_data, geo_learning):
         """Meta-learning client update with individual models.
 
@@ -163,9 +177,20 @@ class GeoLearningSystem:
         # Extract scene features and predict theta
         scene_features = SceneFeatureExtractor.extract_features(processed_data).to(self.device)
 
-        self.meta_models[client_id].eval()
+        # Unseen cameras have no locally trained model. Deploy the trained seen
+        # model whose buffered scene statistics are closest to this scene
+        # (nearest-scene parameter transfer), so the meta ablation measures
+        # meta-learning without federation rather than an untrained network.
+        model = self.meta_models[client_id]
+        if not self.training_mode and not self.client_data_buffer[client_id]:
+            donor_id = self._nearest_trained_client(scene_features)
+            if donor_id is not None:
+                model = self.meta_models[donor_id]
+                logger.info(f"[Meta deploy] {client_id}: nearest-scene transfer from {donor_id}")
+
+        model.eval()
         with torch.no_grad():
-            predicted_theta = self.meta_models[client_id](scene_features)
+            predicted_theta = model(scene_features)
             predicted_theta_values = {
                 k: v.item() if v.dim() == 0 else v.squeeze().item()
                 for k, v in predicted_theta.items()

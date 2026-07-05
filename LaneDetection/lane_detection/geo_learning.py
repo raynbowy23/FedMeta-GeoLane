@@ -411,25 +411,26 @@ class GeometricLearning:
             for s in sumo_center_list
         ]
 
-        # Adjust sumo lane number for detected results.
+        # Associate each detected lane with its reference lane by mean nearest-point
+        # distance in meters. Polyline parameterization direction must not affect the
+        # match (SUMO lane shapes often run opposite to travel direction), so no
+        # index-aligned point comparison.
         matched_sumo_lanes = []
+        matched_idx = []
 
         for detected in detected_center_list:
             min_dist = float('inf')
-            closest = None
+            closest, closest_j = None, -1
 
-            for sumo in sumo_center_list:
-                # dist = torch.cdist(detected, sumo, p=2).mean()
-                try:
-                    dist = torch.sqrt(torch.sum((detected[15] - sumo[15])**2))
-                except:
-                    dist = torch.sqrt(torch.sum((torch.mean(detected) - torch.mean(sumo))**2))
+            for j, sumo in enumerate(sumo_center_list):
+                dist = gps_pairwise_distance(detected, sumo).min(dim=1).values.mean()
 
                 if dist < min_dist:
                     min_dist = dist
-                    closest = sumo
+                    closest, closest_j = sumo, j
 
             matched_sumo_lanes.append(closest.unsqueeze(0)) # shape (1, 30, 2)
+            matched_idx.append(closest_j)
 
         sumo_lanes = torch.cat(matched_sumo_lanes, dim=0) # shape (4, 30, 2)
 
@@ -461,14 +462,21 @@ class GeometricLearning:
                 frechet_dist = frechet_distance(detected_center_list[lane], sumo_lanes[lane])
                 l_cons_list.append(frechet_dist)
 
-            # print(f"SUMO length: {len(sumo_lanes)}, Detected length: {len(detected_center_list)}")
+            # Eq. 7 contrastive term: anchor = detected lane, positive = its matched
+            # reference, negative = the nearest reference lane that is NOT the
+            # positive (hard negative). With a single reference lane in view there is
+            # no valid negative and the term is skipped for that lane.
             anchor = detected_center_list[lane].to(device)
             positive = sumo_lanes[lane].to(device)
-            for j in range(lane_num):
-                if lane == j:
-                    negative = detected_center_list[j].to(device)
-                    l_trip += triplet_loss_fn(anchor.unsqueeze(0), positive.unsqueeze(0), negative.unsqueeze(0))
-                    num_triplets += 1
+            neg_candidates = [s for j, s in enumerate(sumo_center_list) if j != matched_idx[lane]]
+            if neg_candidates:
+                neg_dists = torch.stack([
+                    gps_pairwise_distance(anchor, s.to(device)).min(dim=1).values.mean()
+                    for s in neg_candidates
+                ])
+                negative = neg_candidates[int(neg_dists.argmin())].to(device)
+                l_trip += triplet_loss_fn(anchor.unsqueeze(0), positive.unsqueeze(0), negative.unsqueeze(0))
+                num_triplets += 1
 
         # Combine consistency losses
         if l_cons_list:
