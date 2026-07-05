@@ -118,10 +118,22 @@ class GeometricLearning:
             y = lane_df_sorted["y_gps"].values
 
             try:
-                # Fit spline
-                spline = UnivariateSpline(y, x, s=smoothing)
-                y_fit = np.linspace(y.min(), y.max(), num=num_points)
-                x_fit = spline(y_fit)
+                # Fit the spline in local meter coordinates. s is a squared-residual
+                # budget, so in raw GPS degrees (residuals ~1e-5) any s >= ~1e-6
+                # collapses to one maximally smoothed curve and the meta-learned
+                # smoothing_factor has no effect at all. In meters, s in [1, 20]
+                # spans tight-to-smooth fits as intended. x_gps is latitude and
+                # y_gps is longitude in this pipeline.
+                lat0, lon0 = float(np.mean(x)), float(np.mean(y))
+                m_lat = 111_320.0
+                m_lon = 111_320.0 * np.cos(np.deg2rad(lat0))
+                y_m = (y - lon0) * m_lon
+                x_m = (x - lat0) * m_lat
+                spline = UnivariateSpline(y_m, x_m, s=smoothing)
+                y_fit_m = np.linspace(y_m.min(), y_m.max(), num=num_points)
+                x_fit_m = spline(y_fit_m)
+                y_fit = y_fit_m / m_lon + lon0
+                x_fit = x_fit_m / m_lat + lat0
 
                 # Estimate lane width
                 lane_width = self.estimate_lane_width(lane_df)
@@ -434,6 +446,20 @@ class GeometricLearning:
 
         sumo_lanes = torch.cat(matched_sumo_lanes, dim=0) # shape (4, 30, 2)
 
+        # Orient each matched reference to the detected lane's direction before the
+        # order-sensitive comparisons below (Frechet walks both curves in sequence,
+        # the triplet compares points index-aligned). SUMO lane shapes often run
+        # opposite to the detected travel direction; without this the consistency
+        # term measures lane length instead of deviation for reversed matches.
+        oriented = []
+        for lane in range(lane_num):
+            P, Q = detected_center_list[lane], sumo_lanes[lane]
+            ends = gps_pairwise_distance(P[[0, -1]], Q[[0, -1]])
+            if ends[0, 1] + ends[1, 0] < ends[0, 0] + ends[1, 1]:
+                Q = torch.flip(Q, dims=[0])
+            oriented.append(Q.unsqueeze(0))
+        sumo_lanes = torch.cat(oriented, dim=0)
+
 
         for lane in range(lane_num):
             ## DEBUG plot
@@ -475,6 +501,9 @@ class GeometricLearning:
                     for s in neg_candidates
                 ])
                 negative = neg_candidates[int(neg_dists.argmin())].to(device)
+                ends = gps_pairwise_distance(anchor[[0, -1]], negative[[0, -1]])
+                if ends[0, 1] + ends[1, 0] < ends[0, 0] + ends[1, 1]:
+                    negative = torch.flip(negative, dims=[0])
                 l_trip += triplet_loss_fn(anchor.unsqueeze(0), positive.unsqueeze(0), negative.unsqueeze(0))
                 num_triplets += 1
 

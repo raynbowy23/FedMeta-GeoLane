@@ -454,10 +454,14 @@ class SceneFeatureExtractor:
         point_density = len(processed_data['collect_dots']) / (roi_height * roi_width)
         aspect_ratio = roi_width / roi_height
         
+        # Count features are log-scaled: raw detection counts accumulate over the
+        # whole video history (tens of thousands), and linear scaling saturates the
+        # meta-model's sigmoid heads, pinning predictions to their range bounds for
+        # any busy scene.
         features = [
             contour_count / 10.0, # Normalize
-            vehicle_count / 50.0,
-            point_density * 1000,
+            float(np.log1p(vehicle_count)) / 10.0,
+            float(np.log1p(len(processed_data['collect_dots']))) / 10.0,
             aspect_ratio,
             roi_height / 1000.0
         ]
