@@ -232,10 +232,12 @@ class FederatedMetaLearner:
                     'loss': loss,
                     'metrics': metrics
                 })
-                
-                if loss < best_loss:
-                    best_loss = loss
-                    best_theta = predicted_theta_values
+
+                # Trial 0 is the reference unconditionally: its loss can be inf
+                # (no lanes detected), and inf < inf is false, which would leave
+                # best_theta as None and crash theta aggregation downstream.
+                best_loss = loss
+                best_theta = predicted_theta_values
             except Exception as e:
                 logger.error(f"Error in first trial for client {client_id}: {e}")
                 # Return default values if geo_learning fails
@@ -637,11 +639,13 @@ class FederatedMetaLearner:
             if k in aggregated_metrics and len(aggregated_metrics[k]) > 0
         }
 
-        # Average theta parameters
+        # Average theta parameters (defensive: a failed client can report no theta)
+        client_thetas = [t for t in client_thetas if t is not None]
         avg_theta = {}
-        for key in client_thetas[0]:
-            stacked = torch.stack([torch.tensor(theta[key], dtype=torch.float32) for theta in client_thetas])
-            avg_theta[key] = stacked.mean(dim=0)
+        if client_thetas:
+            for key in client_thetas[0]:
+                stacked = torch.stack([torch.tensor(theta[key], dtype=torch.float32) for theta in client_thetas])
+                avg_theta[key] = stacked.mean(dim=0)
         
         # Log individual client metrics to MLflow
         try:
