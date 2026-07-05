@@ -255,7 +255,7 @@ def geometric_learning(pipeline, g_epoch, data_queue, stop_event, barrier):
     # lane_processor = LaneAssignmentPostProcessor(pipeline.args, pipeline.saving_file_path)
     
     try:
-        for epoch in tqdm(range(g_epoch), desc="Federated Geometric Learning", position=1):
+        for epoch in tqdm(range(g_epoch), desc=f"Geometric Learning ({pipeline.learning_system.strategy})", position=1):
             barrier.wait()
             
             if stop_event.is_set():

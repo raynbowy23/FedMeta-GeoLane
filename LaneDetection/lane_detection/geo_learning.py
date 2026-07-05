@@ -15,6 +15,7 @@ import polars as pl
 
 from .utils import *
 from .loss import *
+from LaneDetection.osm_extraction.utils import interpolate_edge
 
 
 class GeometricLearning:
@@ -284,6 +285,15 @@ class GeometricLearning:
                         ax3.plot(data["left"][:, 1], data["left"][:, 0], color=self.colors[int(lane_id)], linewidth=1.0)
                         ax3.plot(data["right"][:, 1], data["right"][:, 0], color=self.colors[int(lane_id)], linewidth=1.0)
 
+        if not cluster_assignments:
+            # No contour produced any lane cluster (e.g. an aggressive theta such as a
+            # high peak_prominence suppressing every histogram peak). Return the designed
+            # "no lanes detected" outcome so the trial search scores this theta as bad
+            # instead of crashing the whole client round.
+            logger.warning(f"{camera_loc}: no lane clusters found for any contour (theta={self.theta})")
+            traj_df = traj_df.with_columns(pl.lit(-1, dtype=pl.Int64).alias("clustered_id"))
+            return traj_df, lane_boundaries_for_contour
+
         all_assignments = pl.concat(cluster_assignments)
 
         # Make sure to drop the placeholder column before joining
@@ -389,6 +399,17 @@ class GeometricLearning:
             triplet_margin = triplet_margin.item()
         
         triplet_loss_fn = LaneTripletLoss(margin=triplet_margin)
+
+        # SUMO polylines can lose points to the graph dedup in create_sumo_graph
+        # (coordinates shared across lanes in a group are dropped), so resample any
+        # lane that doesn't match the detected 30-point resolution before stacking.
+        target_points = detected_center_list.shape[1] if detected_center_list.dim() == 3 else 30
+        sumo_center_list = [s for s in sumo_center_list if s.shape[0] >= 2]
+        sumo_center_list = [
+            s if s.shape[0] == target_points else torch.tensor(
+                np.asarray(interpolate_edge(s.numpy(), num_points=target_points)), dtype=torch.float32)
+            for s in sumo_center_list
+        ]
 
         # Adjust sumo lane number for detected results.
         matched_sumo_lanes = []

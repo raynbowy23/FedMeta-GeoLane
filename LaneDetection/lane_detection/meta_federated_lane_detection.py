@@ -19,7 +19,7 @@ import matplotlib.pyplot as plt
 from LaneDetection.osm_extraction.utils import compute_lane_width_from_gps
 from LaneDetection.osm_extraction.connect_to_osm import OSMConnection
 
-from .utils import FederatedConfig, SceneFeatureExtractor
+from .utils import FederatedConfig, SceneFeatureExtractor, perturb_theta
 
 logger = logging.getLogger(__name__)
 
@@ -102,7 +102,7 @@ class MetaMLModel(nn.Module):
         # Extract shared features
         features = self.feature_extractor(scene_features.to(self.device))
 
-        print("Extracted features shape:", features.shape)
+        logger.debug("Extracted features shape: %s", features.shape)
         
         # Predict each theta parameter
         theta_dict = {}
@@ -126,14 +126,14 @@ class MetaMLModel(nn.Module):
                 # Others typically 0-1
                 theta_dict[param_name] = torch.sigmoid(head(features)).squeeze()
 
-        print("Predicted theta parameters:", theta_dict)
+        logger.debug("Predicted theta parameters: %s", theta_dict)
         
         loss_weights = {}
         weight_sum = sum(torch.abs(w) for w in self.loss_weights.values())
         for name, weight in self.loss_weights.items():
             loss_weights[f'weight_{name}'] = torch.abs(weight) / weight_sum
 
-        print("Loss weights:", loss_weights)
+        logger.debug("Loss weights: %s", loss_weights)
 
         
         output_dict = {**theta_dict, **loss_weights}
@@ -250,24 +250,8 @@ class FederatedMetaLearner:
 
             # Additional trials with perturbations
             for trial in range(2):
-                perturbed_theta = {}
-                for k, v in predicted_theta_values.items():
-                    noise = torch.randn(1).item() * 0.1
-                    if k == 'width_scale':
-                        perturbed_theta[k] = max(0.5, min(2.0, v + noise))
-                    elif k == 'smoothing_factor':
-                        perturbed_theta[k] = max(1, min(20, v + noise * 10))
-                    elif k == 'triplet_margin':
-                        perturbed_theta[k] = max(0.1, min(2.0, v + noise))
-                    elif k == 'peak_prominence':
-                        # Wide exploration: the useful value can sit far from the
-                        # initial prediction (sparse scenes need LOW prominence to
-                        # recover small lane peaks), so sample across the full range
-                        # instead of a local step the black-box search can't escape.
-                        perturbed_theta[k] = float(np.random.uniform(0.3, 3.0))
-                    else:
-                        perturbed_theta[k] = max(0.1, min(1.0, v + noise))
-                
+                perturbed_theta = perturb_theta(predicted_theta_values)
+
                 # Update geo_learning with perturbed theta
                 for k, v in perturbed_theta.items():
                     geo_learning.theta[k] = torch.tensor(v)

@@ -11,7 +11,7 @@ from pathlib import Path
 
 from utils import compute_loss_for_baseline
 
-from LaneDetection.lane_detection.utils import SceneFeatureExtractor
+from LaneDetection.lane_detection.utils import SceneFeatureExtractor, perturb_theta
 from LaneDetection.lane_detection.meta_federated_lane_detection import (
     MetaMLModel, FederatedMetaLearner
 )
@@ -151,34 +151,54 @@ class GeoLearningSystem:
         return loss, self.fixed_theta, metrics
     
     def _meta_client_update(self, client_id, processed_data, geo_learning):
-        """Meta-learning client update with individual models"""
+        """Meta-learning client update with individual models.
+
+        In training mode this runs the same black-box trial search as the federated
+        strategy (prediction + 2 perturbed trials, keep the best theta by task loss)
+        so the buffered best_theta is a real supervision target. Regressing the model
+        onto its own prediction would make the MSE identically zero and train nothing.
+        """
         start_time = time.time()
 
         # Extract scene features and predict theta
         scene_features = SceneFeatureExtractor.extract_features(processed_data).to(self.device)
-        
+
         self.meta_models[client_id].eval()
         with torch.no_grad():
             predicted_theta = self.meta_models[client_id](scene_features)
             predicted_theta_values = {
-                k: v.item() if v.dim() == 0 else v.squeeze().item() 
+                k: v.item() if v.dim() == 0 else v.squeeze().item()
                 for k, v in predicted_theta.items()
             }
-        
-        # Update geo_learning with predicted theta
+
+        # Trial 0: the meta-model's own prediction
         for k, v in predicted_theta_values.items():
             geo_learning.theta[k] = torch.tensor(v)
-
-        # Run geometric learning
         loss, metrics = self._run_geo_learning(geo_learning, processed_data, client_id)
+        best_loss, best_theta, best_metrics = loss, predicted_theta_values, metrics
 
-        # Store data for meta-model training
-        self.client_data_buffer[client_id].append({
-            'scene_features': scene_features.cpu(),
-            'best_theta': predicted_theta_values,
-            'best_loss': loss,
-            'metrics': metrics
-        })
+        if self.training_mode:
+            for _ in range(2):
+                perturbed_theta = perturb_theta(predicted_theta_values)
+                for k, v in perturbed_theta.items():
+                    geo_learning.theta[k] = torch.tensor(v)
+                try:
+                    trial_loss, trial_metrics = self._run_geo_learning(geo_learning, processed_data, client_id)
+                except Exception as e:
+                    logger.error(f"Error in perturbation trial for client {client_id}: {e}")
+                    continue
+                if trial_loss < best_loss:
+                    best_loss, best_theta, best_metrics = trial_loss, perturbed_theta, trial_metrics
+
+            # Store data for meta-model training
+            self.client_data_buffer[client_id].append({
+                'scene_features': scene_features.cpu(),
+                'best_theta': best_theta,
+                'best_loss': best_loss,
+                'metrics': best_metrics
+            })
+
+        loss, metrics = best_loss, best_metrics
         
         # Calculate communication metrics
         duration = time.time() - start_time
@@ -189,9 +209,9 @@ class GeoLearningSystem:
         metrics.update(self._calculate_communication_metrics(
             upload_size_bytes, download_size_bytes, duration
         ))
-        
-        return loss, predicted_theta_values, metrics
-    
+
+        return loss, best_theta, metrics
+
     def _federated_client_update(self, client_id, processed_data, geo_learning):
         """Federated client update using federated learner"""
         return self.fed_learner.client_update(
@@ -369,10 +389,11 @@ class GeoLearningSystem:
                         f"Min batch loss = {min(batch_losses):.4f}, "
                         f"Max batch loss = {max(batch_losses):.4f}")
             
+        improvement = ((epoch_losses[0] - epoch_losses[-1]) / epoch_losses[0] * 100) if epoch_losses[0] > 0 else 0.0
         logger.info(f"Meta-model training completed. "
                 f"Initial loss: {epoch_losses[0]:.4f}, "
                 f"Final loss: {epoch_losses[-1]:.4f}, "
-                f"Improvement: {((epoch_losses[0] - epoch_losses[-1]) / epoch_losses[0] * 100):.1f}%")
+                f"Improvement: {improvement:.1f}%")
     
     def select_clients(self, available_clients):
         """Select clients for the current mode.

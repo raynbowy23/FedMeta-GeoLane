@@ -405,9 +405,8 @@ class OSMConnection:
                             s=5, alpha=0.7, color=color,
                             label=f'Lane {lane_id}'
                         )
-                    except:
-                        print("Got some error")
-                        print(color)
+                    except Exception as e:
+                        logger.debug(f"Skipping trajectory scatter for lane {lane_id}: {e}")
             
                 # Print the selected target lanes
                 logger.info(f"Target lanes selected based on trajectory density for lane group {lane_group}: {target_lanes}")

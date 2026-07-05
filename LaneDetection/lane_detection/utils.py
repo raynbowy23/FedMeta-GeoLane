@@ -415,6 +415,31 @@ class FederatedMetrics:
         plt.close()
 
 
+def perturb_theta(theta_values):
+    """One black-box exploration step around a predicted theta.
+
+    Shared by the federated and meta strategies so both run the identical search rule (Eq. 9 trial selection).
+    """
+    perturbed = {}
+    for k, v in theta_values.items():
+        noise = torch.randn(1).item() * 0.1
+        if k == 'width_scale':
+            perturbed[k] = max(0.5, min(2.0, v + noise))
+        elif k == 'smoothing_factor':
+            perturbed[k] = max(1, min(20, v + noise * 10))
+        elif k == 'triplet_margin':
+            perturbed[k] = max(0.1, min(2.0, v + noise))
+        elif k == 'peak_prominence':
+            # Wide exploration: the useful value can sit far from the
+            # initial prediction (sparse scenes need LOW prominence to
+            # recover small lane peaks), so sample across the full range
+            # instead of a local step the black-box search can't escape.
+            perturbed[k] = float(np.random.uniform(0.3, 3.0))
+        else:
+            perturbed[k] = max(0.1, min(1.0, v + noise))
+    return perturbed
+
+
 class SceneFeatureExtractor:
     """Advanced scene feature extraction for meta-learning."""
     
