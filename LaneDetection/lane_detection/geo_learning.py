@@ -129,9 +129,26 @@ class GeometricLearning:
                 m_lon = 111_320.0 * np.cos(np.deg2rad(lat0))
                 y_m = (y - lon0) * m_lon
                 x_m = (x - lat0) * m_lat
-                spline = UnivariateSpline(y_m, x_m, s=smoothing)
-                y_fit_m = np.linspace(y_m.min(), y_m.max(), num=num_points)
+                # Many trajectory points share one y value, and that within-group
+                # variance is an irreducible residual no spline can undercut, so
+                # fitpack diverges for any budget below it. Fit the per-y mean
+                # instead (the spline's target is the conditional mean anyway) and
+                # anchor the budget to its straight-line fit residual: smoothing 20
+                # -> line-fit smoothing (the old maximally smoothed behavior),
+                # 1 -> follows curvature closely. Always feasible.
+                y_u, inv = np.unique(y_m, return_inverse=True)
+                if len(y_u) < 5:
+                    continue
+                x_u = np.bincount(inv, weights=x_m) / np.bincount(inv)
+                line_res = x_u - np.polyval(np.polyfit(y_u, x_u, 1), y_u)
+                ssr_line = float(np.sum(line_res ** 2))
+                s_budget = max((smoothing / 20.0) * ssr_line, 0.01 * len(y_u))
+                spline = UnivariateSpline(y_u, x_u, s=s_budget)
+                y_fit_m = np.linspace(y_u.min(), y_u.max(), num=num_points)
                 x_fit_m = spline(y_fit_m)
+                if not np.all(np.isfinite(x_fit_m)):
+                    logger.warning(f"Lane {lane_id}: spline produced non-finite values, skipping lane")
+                    continue
                 y_fit = y_fit_m / m_lon + lon0
                 x_fit = x_fit_m / m_lat + lat0
 
