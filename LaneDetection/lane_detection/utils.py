@@ -415,6 +415,38 @@ class FederatedMetrics:
         plt.close()
 
 
+# The SUMO lane matching threshold: every reference lane in a no-detection scene
+# is at least one full matching threshold away from any detected lane, so this is
+# a conservative floor for the coverage charge, not an estimate.
+NO_DETECTION_COVERAGE_PENALTY_M = 10.0
+
+
+def no_detection_result(processed_data):
+    """Loss and metrics charged when a theta detects zero lanes.
+
+    Keeps the trial search finite (inf poisons loss averages and best-theta
+    selection) and keeps failed epochs visible in the reported lane-count and
+    coverage columns instead of silently dropping out of the averages. Geometry
+    columns that were never measured stay NaN rather than being fabricated.
+    """
+    sumo_node, _ = processed_data.get('sumo_graph', ([], []))
+    ref_count = sum(len(group) for group in sumo_node)
+    loss = 10.0 * max(ref_count, 1)
+    metrics = {
+        'lane_count': 0,
+        'error': 'No lanes detected',
+        'l_lane_count': float(ref_count),
+        'lane_count_err': float(ref_count),
+        'lane_count_exact': 0.0,
+        'geo_coverage_m': NO_DETECTION_COVERAGE_PENALTY_M,
+        'geo_consistency_m': float('nan'),
+        'geo_centerline_m': float('nan'),
+        'geo_width_m': float('nan'),
+        'geo_total_m': float('nan'),
+    }
+    return loss, metrics
+
+
 def perturb_theta(theta_values):
     """One black-box exploration step around a predicted theta.
 

@@ -19,7 +19,7 @@ import matplotlib.pyplot as plt
 from LaneDetection.osm_extraction.utils import compute_lane_width_from_gps
 from LaneDetection.osm_extraction.connect_to_osm import OSMConnection
 
-from .utils import FederatedConfig, SceneFeatureExtractor, perturb_theta
+from .utils import FederatedConfig, SceneFeatureExtractor, perturb_theta, no_detection_result
 
 logger = logging.getLogger(__name__)
 
@@ -492,9 +492,8 @@ class FederatedMetaLearner:
                 return total_loss, metrics
                 
             else:
-                # No lanes detected
                 logger.warning(f"No lanes detected for client {client_id}")
-                return float('inf'), {'lane_count': 0, 'error': 'No lanes detected'}
+                return no_detection_result(processed_data)
                 
         except Exception as e:
             logger.error(f"Error in geo_learning for client {client_id}: {e}")
@@ -627,9 +626,11 @@ class FederatedMetaLearner:
             for k, v in metrics.items():
                 aggregated_metrics[k].append(v)
         
-        # Compute statistics
-        avg_loss = np.mean(aggregated_metrics['losses'])
-        std_loss = np.std(aggregated_metrics['losses'])
+        # Compute statistics over finite losses only (a client can still report
+        # inf on an unexpected exception; it must not poison the round average)
+        finite_losses = [l for l in aggregated_metrics['losses'] if np.isfinite(l)]
+        avg_loss = np.mean(finite_losses) if finite_losses else float('inf')
+        std_loss = np.std(finite_losses) if finite_losses else 0.0
 
         # Average the reported components (incl. model-independent raw metrics).
         # nanmean so a client with no matched lanes (nan) doesn't void the average.

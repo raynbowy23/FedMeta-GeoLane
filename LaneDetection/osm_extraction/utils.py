@@ -80,7 +80,14 @@ def interpolate_edge(edge_points, num_points=100):
         np.ndarray: Interpolated points of shape (num_points, 2).
     """
     edge_points = np.array([np.array(p, dtype=np.float64) for p in edge_points], dtype=np.float64)
-        
+
+    # Consecutive duplicate points give a zero arc-length step, which makes the
+    # spline parameter non-strictly-increasing and splprep rejects the input.
+    # A fully degenerate (zero-length) polyline cannot be parameterized at all.
+    if len(edge_points) >= 2:
+        keep = np.insert(np.linalg.norm(np.diff(edge_points, axis=0), axis=1) > 0, 0, True)
+        edge_points = edge_points[keep]
+
     if len(edge_points) < 2:
         return edge_points
 

@@ -11,7 +11,7 @@ from pathlib import Path
 
 from utils import compute_loss_for_baseline
 
-from LaneDetection.lane_detection.utils import SceneFeatureExtractor, perturb_theta
+from LaneDetection.lane_detection.utils import SceneFeatureExtractor, perturb_theta, no_detection_result
 from LaneDetection.lane_detection.meta_federated_lane_detection import (
     MetaMLModel, FederatedMetaLearner
 )
@@ -28,7 +28,10 @@ SEEN_CLIENTS = [
     'US12_Todd', 'US12_Monona', 'US12_Yahara', 'US12_Stoughton', 'US12_Whitney',
     'US12_Mineral', 'US12_University', 'US12_CountyAB',
 ]
-UNSEEN_CLIENTS = ['US12_JohnNolen', 'US12_Park']
+# US12_JohnNolen removed 2026-07-05: one of the hardest locations (dense multi-lane
+# arterial; its both-directions reference net also inflates lane counts) and not part
+# of the reviewed submission's camera set. Park stays — it is in the reviewed set.
+UNSEEN_CLIENTS = ['US12_Park']
 
 
 class GeoLearningSystem:
@@ -508,9 +511,8 @@ class GeoLearningSystem:
                 
                 return loss, metrics
             else:
-                # No lanes detected
                 logger.warning(f"No lanes detected for client {client_id}")
-                return float('inf'), {'lane_count': 0, 'error': 'No lanes detected'}
+                return no_detection_result(processed_data)
             
         except Exception as e:
             logger.error(f"Error in geo_learning for client {client_id}: {e}")

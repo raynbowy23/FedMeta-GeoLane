@@ -79,13 +79,6 @@ class GeometricLearning:
         kernel /= kernel.sum()
         return np.convolve(data, kernel, mode='same')
 
-    def estimate_lane_width(self, lane_df):
-        """
-        Estimate width from trajectory spread (x spread for vertical lanes).
-        """
-        x = lane_df["x_gps"].values
-        width_est = 2 * np.std(x) # ~95% coverage if Gaussian
-        return width_est
 
     def compute_lane_geometry(self, df_plot, smoothing=10, num_points=30):
         """
@@ -129,50 +122,75 @@ class GeometricLearning:
                 m_lon = 111_320.0 * np.cos(np.deg2rad(lat0))
                 y_m = (y - lon0) * m_lon
                 x_m = (x - lat0) * m_lat
-                # Many trajectory points share one y value, and that within-group
+
+                # Rotate to the lane's principal axis so "along" and "across" are
+                # well defined for ANY road orientation. Fitting lat = f(lon)
+                # directly is only valid for roughly east-west roads; on a
+                # north-south road the roles swap and both the centerline fit and
+                # any width estimate silently degenerate.
+                cov = np.cov(np.stack([y_m, x_m]))
+                ang = 0.5 * np.arctan2(2.0 * cov[0, 1], cov[0, 0] - cov[1, 1])
+                ca, sa = np.cos(ang), np.sin(ang)
+                along = ca * y_m + sa * x_m
+                across = -sa * y_m + ca * x_m
+
+                # Many points can share one along value, and that within-group
                 # variance is an irreducible residual no spline can undercut, so
-                # fitpack diverges for any budget below it. Fit the per-y mean
-                # instead (the spline's target is the conditional mean anyway) and
-                # anchor the budget to its straight-line fit residual: smoothing 20
-                # -> line-fit smoothing (the old maximally smoothed behavior),
-                # 1 -> follows curvature closely. Always feasible.
-                y_u, inv = np.unique(y_m, return_inverse=True)
-                if len(y_u) < 5:
+                # fitpack diverges for any budget below it. Fit the per-along mean
+                # (the spline's target is the conditional mean anyway) and anchor
+                # the budget to its straight-line fit residual: smoothing 20 ->
+                # line-fit smoothing (fewest knots), 1 -> follows curvature.
+                a_u, inv = np.unique(along, return_inverse=True)
+                if len(a_u) < 5:
                     continue
-                x_u = np.bincount(inv, weights=x_m) / np.bincount(inv)
-                line_res = x_u - np.polyval(np.polyfit(y_u, x_u, 1), y_u)
+                c_u = np.bincount(inv, weights=across) / np.bincount(inv)
+                line_res = c_u - np.polyval(np.polyfit(a_u, c_u, 1), a_u)
                 ssr_line = float(np.sum(line_res ** 2))
-                s_budget = max((smoothing / 20.0) * ssr_line, 0.01 * len(y_u))
-                spline = UnivariateSpline(y_u, x_u, s=s_budget)
-                y_fit_m = np.linspace(y_u.min(), y_u.max(), num=num_points)
-                x_fit_m = spline(y_fit_m)
-                if not np.all(np.isfinite(x_fit_m)):
+                s_budget = max((smoothing / 20.0) * ssr_line, 0.01 * len(a_u))
+                spline = UnivariateSpline(a_u, c_u, s=s_budget)
+                along_fit = np.linspace(a_u.min(), a_u.max(), num=num_points)
+                across_fit = spline(along_fit)
+                if not np.all(np.isfinite(across_fit)):
                     logger.warning(f"Lane {lane_id}: spline produced non-finite values, skipping lane")
                     continue
+                # Back-rotate the fitted centerline to the meter frame, then to GPS
+                y_fit_m = ca * along_fit - sa * across_fit
+                x_fit_m = sa * along_fit + ca * across_fit
                 y_fit = y_fit_m / m_lon + lon0
                 x_fit = x_fit_m / m_lat + lat0
 
-                # Estimate lane width
-                lane_width = self.estimate_lane_width(lane_df)
+                # Robust lateral width in meters from the perpendicular spread of
+                # trajectory points around the fitted centerline. The old
+                # 2*std(x_gps) heuristic measured the road's LENGTH component for
+                # any road not running exactly east-west (latitude varies along the
+                # road), inflating widths to tens of meters. p95-p5 of the
+                # perpendicular offsets covers ~90% of a uniform across-lane
+                # distribution and is robust to outliers.
+                # Residuals are taken against a maximally smoothed reference fit
+                # (full line-SSR budget), NOT the theta-smoothed spline above: a
+                # low smoothing_factor lets the centerline wiggle into the
+                # across-lane spread, which would silently absorb the width.
+                width_spline = UnivariateSpline(a_u, c_u, s=max(ssr_line, 0.01 * len(a_u)))
+                slope = width_spline.derivative()(along)
+                perp = (across - width_spline(along)) / np.sqrt(1.0 + slope ** 2)
+                lane_width = float(np.percentile(perp, 95) - np.percentile(perp, 5))
                 if 'width_scale' in self.theta:
                     width_scale = self.theta['width_scale'].item() if isinstance(self.theta['width_scale'], torch.Tensor) else self.theta['width_scale']
                     lane_width *= width_scale
 
-                # Compute direction and normals
-                dx = np.gradient(x_fit)
-                dy = np.gradient(y_fit)
-                norm = np.sqrt(dx**2 + dy**2)
-                dx /= norm
-                dy /= norm
-                nx = -dy
-                ny = dx
+                # Boundaries in the same local meter frame, converted back to GPS
+                dx_m = np.gradient(x_fit_m)
+                dy_m = np.gradient(y_fit_m)
+                norm = np.sqrt(dx_m ** 2 + dy_m ** 2)
+                norm[norm == 0] = 1.0
+                nx = -dy_m / norm
+                ny = dx_m / norm
 
-                # Compute boundaries
                 offset = lane_width / 2
-                x_left = x_fit + nx * offset
-                y_left = y_fit + ny * offset
-                x_right = x_fit - nx * offset
-                y_right = y_fit - ny * offset
+                x_left = (x_fit_m + nx * offset) / m_lat + lat0
+                y_left = (y_fit_m + ny * offset) / m_lon + lon0
+                x_right = (x_fit_m - nx * offset) / m_lat + lat0
+                y_right = (y_fit_m - ny * offset) / m_lon + lon0
 
                 lane_boundaries_by_id[int(lane_id)] = {
                     "center": np.stack([x_fit, y_fit], axis=1),
@@ -433,7 +451,13 @@ class GeometricLearning:
         # (coordinates shared across lanes in a group are dropped), so resample any
         # lane that doesn't match the detected 30-point resolution before stacking.
         target_points = detected_center_list.shape[1] if detected_center_list.dim() == 3 else 30
-        sumo_center_list = [s for s in sumo_center_list if s.shape[0] >= 2]
+        # Drop degenerate references: fewer than 2 points OR zero arc length
+        # (a lane whose 30 points are all the same coordinate cannot be
+        # parameterized and would crash every spline consumer downstream).
+        sumo_center_list = [
+            s for s in sumo_center_list
+            if s.shape[0] >= 2 and float(torch.diff(s, dim=0).abs().sum()) > 0
+        ]
         sumo_center_list = [
             s if s.shape[0] == target_points else torch.tensor(
                 np.asarray(interpolate_edge(s.numpy(), num_points=target_points)), dtype=torch.float32)
@@ -463,18 +487,45 @@ class GeometricLearning:
 
         sumo_lanes = torch.cat(matched_sumo_lanes, dim=0) # shape (4, 30, 2)
 
-        # Orient each matched reference to the detected lane's direction before the
-        # order-sensitive comparisons below (Frechet walks both curves in sequence,
-        # the triplet compares points index-aligned). SUMO lane shapes often run
-        # opposite to the detected travel direction; without this the consistency
-        # term measures lane length instead of deviation for reversed matches.
-        oriented = []
-        for lane in range(lane_num):
-            P, Q = detected_center_list[lane], sumo_lanes[lane]
+        # Orient each matched reference to the detected lane's direction, then clip
+        # it to the detected segment's extent, before the order-sensitive
+        # comparisons below (Frechet walks both curves in sequence, the triplet
+        # compares points index-aligned). SUMO lane shapes often run opposite to
+        # the detected travel direction, and a reference lane extends far beyond
+        # the camera view — without orientation the consistency term measures lane
+        # length, and without clipping it charges the unobservable extent even
+        # when the shapes agree over the common footprint.
+        def _align_reference(P, Q, dense=240):
             ends = gps_pairwise_distance(P[[0, -1]], Q[[0, -1]])
             if ends[0, 1] + ends[1, 0] < ends[0, 0] + ends[1, 1]:
                 Q = torch.flip(Q, dims=[0])
-            oriented.append(Q.unsqueeze(0))
+            # Densify before slicing: the slice endpoints land on reference
+            # vertices, and with 30 points a long lane has many meters between
+            # vertices — discrete Frechet is a max metric, so that overhang alone
+            # would set the consistency floor. Clipping is an accuracy refinement,
+            # so on any numerical failure fall back to the oriented full lane.
+            try:
+                Qd = torch.tensor(np.asarray(interpolate_edge(Q.numpy(), num_points=dense)),
+                                  dtype=torch.float32, device=Q.device)
+                i0 = int(gps_pairwise_distance(P[0:1], Qd).argmin())
+                i1 = int(gps_pairwise_distance(P[-1:], Qd).argmin())
+                lo, hi = min(i0, i1), max(i0, i1)
+                if hi - lo >= 2:
+                    seg = Qd[lo:hi + 1]
+                    if i0 > i1:
+                        seg = torch.flip(seg, dims=[0])
+                    clipped = torch.tensor(
+                        np.asarray(interpolate_edge(seg.numpy(), num_points=Q.shape[0])),
+                        dtype=torch.float32, device=Q.device)
+                    if clipped.shape == Q.shape and bool(torch.all(torch.isfinite(clipped))):
+                        Q = clipped
+            except Exception as e:
+                logger.warning(f"Reference clipping failed, using full lane: {e}")
+            return Q
+
+        oriented = []
+        for lane in range(lane_num):
+            oriented.append(_align_reference(detected_center_list[lane], sumo_lanes[lane]).unsqueeze(0))
         sumo_lanes = torch.cat(oriented, dim=0)
 
 
@@ -517,10 +568,7 @@ class GeometricLearning:
                     gps_pairwise_distance(anchor, s.to(device)).min(dim=1).values.mean()
                     for s in neg_candidates
                 ])
-                negative = neg_candidates[int(neg_dists.argmin())].to(device)
-                ends = gps_pairwise_distance(anchor[[0, -1]], negative[[0, -1]])
-                if ends[0, 1] + ends[1, 0] < ends[0, 0] + ends[1, 1]:
-                    negative = torch.flip(negative, dims=[0])
+                negative = _align_reference(anchor, neg_candidates[int(neg_dists.argmin())].to(device))
                 l_trip += triplet_loss_fn(anchor.unsqueeze(0), positive.unsqueeze(0), negative.unsqueeze(0))
                 num_triplets += 1
 

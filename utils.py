@@ -12,6 +12,7 @@ matplotlib.use('Agg')
 
 from LaneDetection.osm_extraction.utils import compute_lane_width_from_gps
 from LaneDetection.osm_extraction.connect_to_osm import OSMConnection
+from LaneDetection.lane_detection.utils import no_detection_result
 
 logger = logging.getLogger(__name__)
 
@@ -106,9 +107,8 @@ def compute_loss_for_baseline(geo_learning, traj_df, lane_boundaries_for_contour
             return total_loss, metrics
             
         else:
-            # No lanes detected
             logger.warning(f"No lanes detected for client {client_id}")
-            return float('inf'), {'lane_count': 0, 'error': 'No lanes detected'}
+            return no_detection_result(processed_data)
             
     except Exception as e:
         logger.error(f"Error in geo_learning for client {client_id}: {e}")
