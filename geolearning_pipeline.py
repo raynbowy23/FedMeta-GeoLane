@@ -81,7 +81,9 @@ class GeometricLearningPipeline:
         
         # Train models
         # self.learning_system.train_models(g_epoch)
-        self.learning_system.train_models(selected_clients, local_epochs=1, lr=1e-3)
+        # local_epochs=10 gives federated clients the same per-round gradient
+        # budget as the meta strategy's per-camera training (10 epochs/round).
+        self.learning_system.train_models(selected_clients, local_epochs=10, lr=1e-3)
         
         logger.info(f"Epoch {g_epoch} - Avg Loss: {aggregated['avg_loss']:.4f} "
                    f"(±{aggregated.get('std_loss', 0):.4f}), "

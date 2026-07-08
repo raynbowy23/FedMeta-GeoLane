@@ -112,6 +112,19 @@ class LaneContinuousProcess:
                                 Path(pre_filepath, f"trajectory.csv"),
                                 schema_overrides={"target_lane_id": pl.Utf8}
                             )
+
+                            # Data-scarcity experiments: keep a seeded fraction of
+                            # vehicle ids (and thin the detection collections to
+                            # match) to emulate a site with less observed traffic.
+                            frac = float(getattr(args, 'data_fraction', 1.0))
+                            if frac < 1.0:
+                                rng = np.random.default_rng(int(getattr(args, 'seed', 42)))
+                                ids = out_df['id'].unique().to_list()
+                                keep = rng.choice(ids, size=max(1, int(len(ids) * frac)), replace=False)
+                                out_df = out_df.filter(pl.col('id').is_in(keep.tolist()))
+                                collect_cars = [c for c in collect_cars if rng.random() < frac]
+                                collect_det_dots_including_truck = [d for d in collect_det_dots_including_truck if rng.random() < frac]
+                                logger.info(f"{camera_loc}: data_fraction={frac} -> {len(keep)}/{len(ids)} ids kept")
                         else:
                             skip_continuous_learning = False # Temporal workaround. If no historical data, need to run continuous learning
 

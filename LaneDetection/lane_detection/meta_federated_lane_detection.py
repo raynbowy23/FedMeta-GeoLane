@@ -19,7 +19,8 @@ import matplotlib.pyplot as plt
 from LaneDetection.osm_extraction.utils import compute_lane_width_from_gps
 from LaneDetection.osm_extraction.connect_to_osm import OSMConnection
 
-from .utils import FederatedConfig, SceneFeatureExtractor, perturb_theta, no_detection_result
+from .utils import (FederatedConfig, SceneFeatureExtractor, perturb_theta, no_detection_result,
+                    trial_score, SCENE_FEATURE_DIM, DEPLOYMENT_CALIBRATION_TRIALS)
 
 logger = logging.getLogger(__name__)
 
@@ -43,7 +44,7 @@ class MetaMLModel(nn.Module):
     Black-box meta-learner that maps scene features to optimal theta parameters.
     No gradient-based adaptation - directly predicts parameters from features.
     """
-    def __init__(self, feature_dim=5, hidden_dim=128, num_theta_params=5, config_path=None):
+    def __init__(self, feature_dim=SCENE_FEATURE_DIM, hidden_dim=128, num_theta_params=5, config_path=None):
         super(MetaMLModel, self).__init__()
         
         self.config = FederatedConfig(config_path)
@@ -118,10 +119,12 @@ class MetaMLModel(nn.Module):
                 # Smoothing factor typically 1-20
                 theta_dict[param_name] = torch.sigmoid(head(features)).squeeze() * 19 + 1
             elif param_name == 'peak_prominence':
-                # Histogram peak salience for lane counting, range ~0.3-3.0.
-                # The meta-learner lowers it for sparse scenes to recover
-                # low-traffic lanes and raises it to reject spurious peaks.
-                theta_dict[param_name] = torch.sigmoid(head(features)).squeeze() * 2.7 + 0.3
+                # RELATIVE peak salience in (0.05, 0.95): a fraction of the
+                # scene's max smoothed histogram peak (the histogram is
+                # normalized before peak finding), so the value is scale-free
+                # across sparse and busy scenes. Lower recovers weak lanes,
+                # higher rejects spurious peaks.
+                theta_dict[param_name] = torch.sigmoid(head(features)).squeeze() * 0.9 + 0.05
             else:
                 # Others typically 0-1
                 theta_dict[param_name] = torch.sigmoid(head(features)).squeeze()
@@ -152,6 +155,9 @@ class FederatedMetaLearner:
         self.global_data_buffer = []
         self.training_history = []
         self.visualize_lanes = visualize_lanes
+        # Cached test-time calibrated thetas for clients with no local training
+        # history (unseen sites), filled on first deployment contact.
+        self.deployment_theta = {}
 
         self.colors = [
             (1.00, 0.00, 0.00),  # vivid red
@@ -238,6 +244,7 @@ class FederatedMetaLearner:
                 # best_theta as None and crash theta aggregation downstream.
                 best_loss = loss
                 best_theta = predicted_theta_values
+                best_score = trial_score(loss, metrics)
             except Exception as e:
                 logger.error(f"Error in first trial for client {client_id}: {e}")
                 # Return default values if geo_learning fails
@@ -267,7 +274,8 @@ class FederatedMetaLearner:
                         'metrics': metrics
                     })
                     
-                    if loss < best_loss:
+                    if trial_score(loss, metrics) < best_score:
+                        best_score = trial_score(loss, metrics)
                         best_loss = loss
                         best_theta = perturbed_theta
                 except Exception as e:
@@ -297,28 +305,65 @@ class FederatedMetaLearner:
             })
             
         else:
-            # Deployment mode: use predicted theta directly
-            with torch.no_grad():
-                predicted_theta = self.meta_model(scene_features)
-                predicted_theta_values = {}
-                for k, v in predicted_theta.items():
-                    if isinstance(v, torch.Tensor):
-                        predicted_theta_values[k] = v.item() if v.dim() == 0 else v.squeeze().item()
-                    else:
-                        predicted_theta_values[k] = float(v)
-            
+            # Deployment: every site runs its best-known configuration, one
+            # uniform rule for Meta and FedMeta. Seen sites reuse the best theta
+            # from their own federated training history (local evidence beats
+            # re-predicting through the amplitude-compressed global model).
+            # Unseen sites get the global prediction plus a small
+            # weakly-supervised calibration budget on arrival (the OSM reference
+            # exists there too); the result is cached. No data leaves any site.
+            calibrate = False
+            if client_id in self.deployment_theta:
+                predicted_theta_values = self.deployment_theta[client_id]
+            elif self.client_data_buffer.get(client_id):
+                predicted_theta_values = self._best_theta_from_buffer(client_id)
+                self.deployment_theta[client_id] = predicted_theta_values
+            else:
+                with torch.no_grad():
+                    predicted_theta = self.meta_model(scene_features)
+                    predicted_theta_values = {}
+                    for k, v in predicted_theta.items():
+                        if isinstance(v, torch.Tensor):
+                            predicted_theta_values[k] = v.item() if v.dim() == 0 else v.squeeze().item()
+                        else:
+                            predicted_theta_values[k] = float(v)
+                calibrate = True
+
             for k, v in predicted_theta_values.items():
                 geo_learning.theta[k] = torch.tensor(v)
-                
+
             try:
                 best_loss, metrics = self._run_geo_learning(geo_learning, processed_data, client_id)
                 best_theta = predicted_theta_values
+                if calibrate:
+                    best_score = trial_score(best_loss, metrics)
+                    for _ in range(DEPLOYMENT_CALIBRATION_TRIALS):
+                        cand = perturb_theta(predicted_theta_values)
+                        for k, v in cand.items():
+                            geo_learning.theta[k] = torch.tensor(v)
+                        try:
+                            c_loss, c_metrics = self._run_geo_learning(geo_learning, processed_data, client_id)
+                        except Exception as e:
+                            logger.error(f"Calibration trial failed for {client_id}: {e}")
+                            continue
+                        if trial_score(c_loss, c_metrics) < best_score:
+                            best_score = trial_score(c_loss, c_metrics)
+                            best_loss, best_theta, metrics = c_loss, cand, c_metrics
+                    self.deployment_theta[client_id] = best_theta
+                    logger.info(f"[Deploy] {client_id}: test-time calibration done (prominence {best_theta.get('peak_prominence', float('nan')):.3f})")
             except Exception as e:
                 logger.error(f"Error in deployment mode for client {client_id}: {e}")
                 return 1.0, predicted_theta_values, {}
         
         return best_loss, best_theta, metrics
     
+    def _best_theta_from_buffer(self, client_id):
+        """The client's best recorded theta from its training-time trial history."""
+        buf = self.client_data_buffer.get(client_id, [])
+        finite = [b for b in buf if np.isfinite(b.get('best_loss', float('inf'))) and b.get('best_theta')]
+        pick = min(finite, key=lambda b: b['best_loss']) if finite else buf[-1]
+        return pick['best_theta']
+
     def _fedavg_state_dicts(self, global_state, client_states, client_sizes):
         assert len(client_states) == len(client_sizes) > 0
         new_state = {k: torch.zeros_like(v) for k, v in global_state.items()}
@@ -475,7 +520,7 @@ class FederatedMetaLearner:
                     'l_trip': l_trip.item() if isinstance(l_trip, torch.Tensor) else float(l_trip),
                     'l_geo': l_geo.item() if isinstance(l_geo, torch.Tensor) else float(l_geo),
                     'detected_lanes': len(detected_center_list),
-                    'sumo_lanes': len(sumo_center_tensor) if sumo_center_tensor[0].shape[0] > 0 else 0
+                    'sumo_lanes': len(sumo_center_tensor) if sumo_center_tensor and sumo_center_tensor[0].shape[0] > 0 else 0
                 }
 
                 metrics.update(raw_metrics)
@@ -635,9 +680,10 @@ class FederatedMetaLearner:
         # Average the reported components (incl. model-independent raw metrics).
         # nanmean so a client with no matched lanes (nan) doesn't void the average.
         avg_metrics = {
-            k: float(np.nanmean(aggregated_metrics[k]))
+            k: float(np.nanmean(np.asarray(aggregated_metrics[k], dtype=float)))
             for k in loss_component_keys
-            if k in aggregated_metrics and len(aggregated_metrics[k]) > 0
+            if k in aggregated_metrics
+            and not np.all(np.isnan(np.asarray(aggregated_metrics[k], dtype=float)))
         }
 
         # Average theta parameters (defensive: a failed client can report no theta)
@@ -726,7 +772,7 @@ class FederatedLaneDetectionSystem:
         
         # Initialize meta-model
         self.meta_model = MetaMLModel(
-            feature_dim=5,
+            feature_dim=SCENE_FEATURE_DIM,
             hidden_dim=128,
             num_theta_params=5
         ).to(self.device)

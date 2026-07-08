@@ -11,6 +11,7 @@ logger = logging.getLogger(__name__)
 from sklearn.cluster import KMeans
 from scipy.signal import find_peaks
 from scipy.interpolate import UnivariateSpline
+from scipy.optimize import linear_sum_assignment
 import polars as pl
 
 from .utils import *
@@ -41,7 +42,7 @@ class GeometricLearning:
             'triplet_margin': torch.tensor(0.8),
             'smoothing_factor': torch.tensor(10.0),
             'sigma': torch.tensor(2.0),
-            'peak_prominence': torch.tensor(1.0),
+            'peak_prominence': torch.tensor(0.5),
         }
 
         self.colors = [
@@ -271,15 +272,22 @@ class GeometricLearning:
                 smoothed_hist = self.gaussian_filter(hist_vals, window_size=5, sigma=2)
 
             # Adaptive peak detection: meta-learned peak salience (theta_prominence).
-            # Lower values recover small peaks from sparse / low-traffic lanes;
-            # higher values suppress spurious peaks in busy or noisy scenes.
-            prominence = self.theta.get('peak_prominence', torch.tensor(1.0))
+            # RELATIVE peak salience: the histogram is normalized by its max
+            # smoothed peak, so peak_prominence is a scale-free fraction in
+            # (0, 1) with one meaning in every scene. On raw counts the right
+            # absolute threshold depends on traffic volume (sparse scenes have
+            # peaks of ~1 vehicle, busy scenes hundreds), which forced the
+            # meta-learner to infer scene scale from coarse features. Lower
+            # values recover weak lanes; higher values suppress spurious peaks.
+            prominence = self.theta.get('peak_prominence', torch.tensor(0.5))
             if isinstance(prominence, torch.Tensor):
                 prominence = prominence.item()
+            hist_max = float(np.max(smoothed_hist))
+            norm_hist = smoothed_hist / hist_max if hist_max > 0 else smoothed_hist
             # Use the same salience floor for height so that genuine peaks
             # attenuated by Gaussian smoothing are not pre-filtered by the
             # height gate before the prominence test is applied.
-            peaks, _ = find_peaks(smoothed_hist, height=prominence, distance=3, prominence=prominence)
+            peaks, _ = find_peaks(norm_hist, height=prominence, distance=3, prominence=prominence)
             n_lanes = len(peaks)
 
             logger.info(f"Estimated number of lanes: {n_lanes}")
@@ -464,26 +472,41 @@ class GeometricLearning:
             for s in sumo_center_list
         ]
 
-        # Associate each detected lane with its reference lane by mean nearest-point
-        # distance in meters. Polyline parameterization direction must not affect the
-        # match (SUMO lane shapes often run opposite to travel direction), so no
-        # index-aligned point comparison.
+        # No evidence-backed reference lanes (possible at very low data volume:
+        # target-lane selection requires 30 nearby points per lane). The epoch is
+        # unevaluable rather than good or bad: finite loss to keep the trial
+        # search alive, NaN metrics so it drops out of averages.
+        if not sumo_center_list:
+            logger.warning("No reference lanes after evidence filtering; epoch unevaluable")
+            nan = float('nan')
+            return (torch.tensor(10.0 * max(lane_num, 1)), lane_num, torch.tensor(0.0),
+                    torch.tensor(0.0), torch.tensor(0.0),
+                    {'geo_consistency_m': nan, 'geo_coverage_m': nan, 'geo_centerline_m': nan,
+                     'geo_width_m': nan, 'geo_total_m': nan, 'lane_count_err': nan,
+                     'lane_count_exact': nan, 'error': 'no reference lanes'})
+
+        # Associate detected lanes with reference lanes by mean nearest-point
+        # distance in meters, ONE-TO-ONE (Hungarian assignment). Greedy nearest
+        # matching let two detected lanes claim the same reference at multi-lane
+        # sites (3/8 lanes at Mineral), inflating the geometry terms while real
+        # references sat unmatched. Polyline parameterization direction must not
+        # affect the cost (SUMO shapes often run opposite to travel direction),
+        # so no index-aligned comparison. Detected lanes beyond the reference
+        # count fall back to their nearest reference (shared).
+        cost = torch.zeros((lane_num, len(sumo_center_list)))
+        for i, detected in enumerate(detected_center_list):
+            for j, sumo in enumerate(sumo_center_list):
+                cost[i, j] = gps_pairwise_distance(detected, sumo).min(dim=1).values.mean()
+
+        row_ind, col_ind = linear_sum_assignment(cost.numpy())
+        assignment = dict(zip(row_ind.tolist(), col_ind.tolist()))
+
         matched_sumo_lanes = []
         matched_idx = []
-
-        for detected in detected_center_list:
-            min_dist = float('inf')
-            closest, closest_j = None, -1
-
-            for j, sumo in enumerate(sumo_center_list):
-                dist = gps_pairwise_distance(detected, sumo).min(dim=1).values.mean()
-
-                if dist < min_dist:
-                    min_dist = dist
-                    closest, closest_j = sumo, j
-
-            matched_sumo_lanes.append(closest.unsqueeze(0)) # shape (1, 30, 2)
-            matched_idx.append(closest_j)
+        for i in range(lane_num):
+            j = assignment.get(i, int(cost[i].argmin()))
+            matched_sumo_lanes.append(sumo_center_list[j].unsqueeze(0))
+            matched_idx.append(j)
 
         sumo_lanes = torch.cat(matched_sumo_lanes, dim=0) # shape (4, 30, 2)
 

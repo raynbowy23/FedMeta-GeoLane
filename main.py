@@ -38,6 +38,7 @@ parser.add_argument('--skip_continuous_learning', action='store_true', help='Ski
 parser.add_argument('--lambda_thres', type=int, default='120', help='Criteria of stopping the cycle learning')
 parser.add_argument('--cnts_threshold', type=int, default='0', help='Contours threshold')
 parser.add_argument('--centralized', action='store_true', help='Centralized learning or not')
+parser.add_argument('--data_fraction', type=float, default=1.0, help='Fraction of trajectory ids kept per camera (data-scarcity experiments)')
 
 # Federated learning specific arguments
 parser.add_argument('--federated', action='store_true', help='Use federated meta-learning')
@@ -92,8 +93,8 @@ with open(Path(args.dataset_path, "camera_location_list.txt"), 'r') as f:
 
 barrier = threading.Barrier(2) # 2 threads need to sync
 
-# Set random seeds for reproducibility
-seed = 42
+# Set random seeds for reproducibility (--seed, default 42)
+seed = args.seed
 random.seed(seed)
 np.random.seed(seed)
 torch.manual_seed(seed)
@@ -107,6 +108,7 @@ def main():
     with mlflow.start_run():
         mlflow.log_param("strategy", args.model)
         mlflow.log_param("seed", args.seed)
+        mlflow.log_param("data_fraction", args.data_fraction)
         mlflow.log_param("device", device)
         mlflow.log_param("num_cameras", len(camera_loc_list))
 

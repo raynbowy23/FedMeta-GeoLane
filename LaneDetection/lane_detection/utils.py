@@ -3,9 +3,16 @@ import cv2
 import yaml
 import torch
 import numpy as np
+import polars as pl
 from pathlib import Path
+from scipy.signal import find_peaks
+from scipy.ndimage import gaussian_filter1d
 import matplotlib.pyplot as plt
 import logging
+
+# Scene feature vector length. The last three are relative peak-salience
+# statistics added so the meta-model can see the structure it thresholds.
+SCENE_FEATURE_DIM = 8
 
 logger = logging.getLogger(__name__)
 
@@ -415,6 +422,27 @@ class FederatedMetrics:
         plt.close()
 
 
+def trial_score(loss, metrics):
+    """Model-independent score for ranking black-box trials.
+
+    Ranks by the raw geometric total in meters when available. The weighted
+    l_total is gameable by the predicted loss weights (compute_loss does not
+    renormalize them), so ranking trials by it lets weight-lowering noise win
+    over genuinely better detections. Falls back to the loss when no raw metric
+    exists (e.g. a no-detection trial).
+    """
+    v = metrics.get('geo_total_m') if isinstance(metrics, dict) else None
+    if v is not None and not (isinstance(v, float) and np.isnan(v)):
+        return float(v)
+    return float(loss) if np.isfinite(loss) else float('inf')
+
+
+# Weakly-supervised trial budget for test-time calibration at sites with no
+# local training history. Both FedMeta (global-model init) and Meta
+# (nearest-scene donor init) receive the SAME budget so the comparison measures
+# initialization quality, not adaptation opportunity.
+DEPLOYMENT_CALIBRATION_TRIALS = 2
+
 # The SUMO lane matching threshold: every reference lane in a no-detection scene
 # is at least one full matching threshold away from any detected lane, so this is
 # a conservative floor for the coverage charge, not an estimate.
@@ -454,6 +482,12 @@ def perturb_theta(theta_values):
     """
     perturbed = {}
     for k, v in theta_values.items():
+        # Loss weights are not search dimensions. Perturbing them (unnormalized)
+        # lets a trial score a lower weighted loss without any detection change,
+        # so keep the model's softmax-normalized values fixed across trials.
+        if k.startswith('weight_'):
+            perturbed[k] = v
+            continue
         noise = torch.randn(1).item() * 0.1
         if k == 'width_scale':
             perturbed[k] = max(0.5, min(2.0, v + noise))
@@ -462,11 +496,11 @@ def perturb_theta(theta_values):
         elif k == 'triplet_margin':
             perturbed[k] = max(0.1, min(2.0, v + noise))
         elif k == 'peak_prominence':
-            # Wide exploration: the useful value can sit far from the
-            # initial prediction (sparse scenes need LOW prominence to
-            # recover small lane peaks), so sample across the full range
-            # instead of a local step the black-box search can't escape.
-            perturbed[k] = float(np.random.uniform(0.3, 3.0))
+            # Wide exploration across the full RELATIVE range (fraction of the
+            # scene's max smoothed peak): the useful value can sit far from the
+            # initial prediction, so sample the range instead of a local step
+            # the black-box search cannot escape.
+            perturbed[k] = float(np.random.uniform(0.05, 0.95))
         else:
             perturbed[k] = max(0.1, min(1.0, v + noise))
     return perturbed
@@ -475,6 +509,46 @@ def perturb_theta(theta_values):
 class SceneFeatureExtractor:
     """Advanced scene feature extraction for meta-learning."""
     
+    @staticmethod
+    def peak_statistics(processed_data):
+        """Relative peak-salience statistics of the per-contour lane histograms.
+
+        Mirrors the histogram path in geo_learning.run (per-id mean x per
+        contour, smoothed, normalized by the max peak) and summarizes the
+        candidate-peak structure. Without these the correct peak_prominence
+        must be inferred indirectly from coarse count features, which is the
+        measured cause of the global model's compressed scene response.
+        Returns [n_candidate_peaks/10, median relative prominence, spread of
+        relative prominences]; zeros when trajectories are unavailable.
+        """
+        gps_df = processed_data.get('gps_df') if isinstance(processed_data, dict) else None
+        try:
+            if gps_df is None or len(gps_df) == 0:
+                return [0.0, 0.0, 0.0]
+            df = gps_df if isinstance(gps_df, pl.DataFrame) else pl.DataFrame(gps_df)
+            agg = df.group_by(['contour_id', 'id']).agg(pl.col('x_gps').mean().alias('xm')).drop_nulls()
+        except Exception:
+            return [0.0, 0.0, 0.0]
+
+        proms = []
+        for cnt in agg['contour_id'].unique().to_list():
+            means = agg.filter(pl.col('contour_id') == cnt)['xm'].to_numpy()
+            # NaN GPS points survive drop_nulls (NaN is not null in polars) and
+            # make np.histogram's range autodetection blow up.
+            means = means[np.isfinite(means)]
+            if len(means) < 3:
+                continue
+            hist, _ = np.histogram(means, bins=50)
+            smoothed = gaussian_filter1d(hist.astype(float), sigma=2)
+            m = float(smoothed.max())
+            if m <= 0:
+                continue
+            _, props = find_peaks(smoothed / m, prominence=0.02)
+            proms.extend(props['prominences'].tolist())
+        if not proms:
+            return [0.0, 0.0, 0.0]
+        return [len(proms) / 10.0, float(np.median(proms)), float(np.std(proms))]
+
     @staticmethod
     def extract_features(processed_data, include_advanced=False):
         """Extract comprehensive scene features."""
@@ -496,7 +570,7 @@ class SceneFeatureExtractor:
             float(np.log1p(len(processed_data['collect_dots']))) / 10.0,
             aspect_ratio,
             roi_height / 1000.0
-        ]
+        ] + SceneFeatureExtractor.peak_statistics(processed_data)
         
         # TODO: not included in the journal
         if include_advanced:

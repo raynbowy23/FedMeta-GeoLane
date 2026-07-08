@@ -336,13 +336,16 @@ class OSMConnection:
 
                 min_points_threshold = 30
 
-                if len(lane_counts) > 0:
-                    target_lanes = {
-                        lane if count >= min_points_threshold else np.str_(-1)
-                        for lane, count in lane_counts.items()
-                    }
-                else:
-                    target_lanes = np.str_(-1)
+                # Keep only lanes with enough nearby trajectory evidence. Lanes
+                # under the threshold are DROPPED (the old code replaced each with
+                # a '-1' string that leaked into the set), and junction-internal
+                # lanes (':'-prefixed connector stubs) are excluded because they
+                # are not comparable lane references and inflate both the lane
+                # count and the matching pool.
+                target_lanes = {
+                    lane for lane, count in lane_counts.items()
+                    if count >= min_points_threshold and not str(lane).startswith(':')
+                }
 
                 # Ensure lane_group exists in the dictionary
                 if lane_group not in lane_group_dict:
@@ -353,9 +356,11 @@ class OSMConnection:
                 gps_traj_points = gps_traj_points[valid_points]
 
                 # Store lane points in a structured dictionary
+                # A group with no evidence-backed lanes stays empty. The old code
+                # inserted a fake all-zeros lane here, which counted as a
+                # reference lane and produced degenerate zero-length polylines
+                # downstream.
                 for lane_id, points in gps_lane_geometries.items():
-                    if target_lanes == "-1":
-                        lane_group_dict[lane_group] = {-1: np.zeros((10, 2))}
                     if lane_id in target_lanes: # Only keep lanes with enough nearby trajectory points
 
                         # We want to regulate points to only proximity, otherwise SUMO covers larger area so we cannot compare fairly
