@@ -33,7 +33,7 @@ UNSEEN = ['US12_Park', 'US12_Greenway', 'I43_Keefe', 'I43_Walnut']
 def nearest_donor_theta(snap, cam_feats):
     """Meta unseen deployment: nearest-scene seen donor predicts theta."""
     best_d, best_p = float('inf'), None
-    for s in SEEN + ['US12_Stoughton']:
+    for s in SEEN:
         p = snap / f'meta_model_{s}.pth'
         if not p.exists():
             continue

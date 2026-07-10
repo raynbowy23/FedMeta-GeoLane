@@ -30,9 +30,19 @@ logger = logging.getLogger(__name__)
 # calibration or reference-geometry error, not detection differences). Like
 # JohnNolen it was added during the revision and is not in the reviewed set.
 SEEN_CLIENTS = [
-    'US12_Todd', 'US12_Monona', 'US12_Yahara', 'US12_Stoughton',
+    'US12_Todd', 'US12_Monona', 'US12_Yahara',
     'US12_Mineral', 'US12_University', 'US12_CountyAB',
 ]
+# UNIFORM SITE-EXCLUSION RULE (2026-07-10): a site is excluded from the split when
+# its annotation-based detection error under the FIXED baseline theta exceeds 5 m
+# (reference_audit.py; model-independent, so the rule cannot favor any method).
+# Applied to all candidate sites it excludes exactly US12_Stoughton (6.83 m,
+# near-horizon GCPs) and US12_Whitney (7.06 m) — every retained site is
+# 0.20-4.32 m (post-lateral audit, 2026-07-10).
+# CountyAB is retained because its large error is on the OSM REFERENCE side, not
+# detection. Excluded sites remain as the R1.3 calibration case studies; re-picking
+# their GCPs (bringing them under 5 m) readmits them. JohnNolen removed separately
+# (not in the reviewed submission's camera set).
 # US12_JohnNolen removed 2026-07-05: one of the hardest locations (dense multi-lane
 # arterial; its both-directions reference net also inflates lane counts) and not part
 # of the reviewed submission's camera set. Park stays — it is in the reviewed set.

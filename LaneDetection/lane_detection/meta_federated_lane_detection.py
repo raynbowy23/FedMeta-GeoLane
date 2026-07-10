@@ -276,6 +276,7 @@ class FederatedMetaLearner:
                 # best_theta as None and crash theta aggregation downstream.
                 best_loss = loss
                 best_theta = predicted_theta_values
+                best_metrics = metrics
                 best_score = trial_score(loss, metrics)
             except Exception as e:
                 logger.error(f"Error in first trial for client {client_id}: {e}")
@@ -310,6 +311,7 @@ class FederatedMetaLearner:
                         best_score = trial_score(loss, metrics)
                         best_loss = loss
                         best_theta = perturbed_theta
+                        best_metrics = metrics
                 except Exception as e:
                     logger.error(f"Error in trial {trial} for client {client_id}: {e}")
                     continue
@@ -328,11 +330,14 @@ class FederatedMetaLearner:
 
             logger.info(f"Client {client_id}: Upload = {upload_size_bytes} bytes, Download = {download_size_bytes} bytes, Latency = {metrics['latency']:.2f}s, BPS = {metrics['bps']:.2f} bps")
             
-            # Store data for meta-model training
+            # Store data for meta-model training. 'metrics' (the BEST trial's raw
+            # metrics) is what trial_score ranks the deployed theta by — the same
+            # rule the meta strategy uses, so the two pickers cannot diverge.
             self.client_data_buffer[client_id].append({
                 'scene_features': scene_features.cpu(),
                 'best_theta': best_theta,
                 'best_loss': best_loss,
+                'metrics': best_metrics,
                 'trial_results': trial_results
             })
             
@@ -418,10 +423,16 @@ class FederatedMetaLearner:
         return best_loss, best_theta, metrics
     
     def _best_theta_from_buffer(self, client_id):
-        """The client's best recorded theta from its training-time trial history."""
+        """The client's best recorded theta from its training-time trial history,
+        ranked by trial_score — the SAME rule the meta strategy's picker uses.
+        Ranking by weighted best_loss here while meta ranked by trial_score gave
+        the two strategies different deployment-selection rules (the Mineral
+        lane_err 8.3-vs-1.1 artifact). Entries from old checkpoints without a
+        'metrics' key fall back to the loss inside trial_score."""
         buf = self.client_data_buffer.get(client_id, [])
         finite = [b for b in buf if np.isfinite(b.get('best_loss', float('inf'))) and b.get('best_theta')]
-        pick = min(finite, key=lambda b: b['best_loss']) if finite else buf[-1]
+        pick = (min(finite, key=lambda b: trial_score(b['best_loss'], b.get('metrics', {}) or {}))
+                if finite else buf[-1])
         return pick['best_theta']
 
     def _fedavg_state_dicts(self, global_state, client_states, client_sizes):

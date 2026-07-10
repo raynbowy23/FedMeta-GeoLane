@@ -422,18 +422,34 @@ class FederatedMetrics:
         plt.close()
 
 
-def trial_score(loss, metrics):
-    """Model-independent score for ranking black-box trials.
+# Meters of score penalty per lane of count error in trial ranking. geo_total_m
+# alone REWARDS over-segmentation (more detected lanes improve coverage and the
+# matched-lane means), so a score without a count term drifts the black-box
+# search toward shattering lanes — measured at Mineral, where a lane_err=9 theta
+# (prominence 0.066) scored 36.8 m vs 40.3 m for the lane_err=1 theta and won.
+LANE_COUNT_SCORE_WEIGHT_M = 5.0
 
-    Ranks by the raw geometric total in meters when available. The weighted
-    l_total is gameable by the predicted loss weights (compute_loss does not
-    renormalize them), so ranking trials by it lets weight-lowering noise win
-    over genuinely better detections. Falls back to the loss when no raw metric
-    exists (e.g. a no-detection trial).
+
+def trial_score(loss, metrics):
+    """Model-independent score for ranking black-box trials AND for choosing the
+    deployed theta from a training buffer. ONE rule for every strategy: Meta and
+    FedMeta previously picked deployment thetas by different rules (trial_score
+    vs weighted best_loss), which alone produced Meta's Mineral lane_err 8.3 vs
+    Fed's 1.1 — an artifact, not a model difference.
+
+    Score = raw geometric total in meters + LANE_COUNT_SCORE_WEIGHT_M per lane
+    of count error. The weighted l_total is gameable by the predicted loss
+    weights (compute_loss does not renormalize them), so ranking trials by it
+    lets weight-lowering noise win over genuinely better detections. Falls back
+    to the loss when no raw metric exists (e.g. a no-detection trial).
     """
     v = metrics.get('geo_total_m') if isinstance(metrics, dict) else None
     if v is not None and not (isinstance(v, float) and np.isnan(v)):
-        return float(v)
+        score = float(v)
+        le = metrics.get('lane_count_err')
+        if le is not None and np.isfinite(le):
+            score += LANE_COUNT_SCORE_WEIGHT_M * float(le)
+        return score
     return float(loss) if np.isfinite(loss) else float('inf')
 
 
@@ -506,6 +522,83 @@ def perturb_theta(theta_values):
     return perturbed
 
 
+def lateral_offsets(mean_lat, mean_lon, first_lat, first_lon, last_lat, last_lon,
+                    min_disp_m=5.0):
+    """Across-road (lateral) coordinate in meters for each vehicle in a contour.
+
+    The lane separator used to histogram each vehicle's mean x_gps, a fixed
+    coordinate axis. That mixes lateral offset with longitudinal position, so
+    the histogram's bin width scales with road LENGTH in view (50-130 m ->
+    2-2.6 m bins) while the signal is 3.5 m lane spacing, and find_peaks'
+    3-bin minimum distance then makes adjacent lanes unresolvable at long-view
+    sites regardless of theta (measured: University 6.4-7.7 m minimum peak
+    separation; its two missed lanes are merged pairs).
+
+    This computes the road axis from per-vehicle displacement directions
+    (direction-agnostic circular mean, robust to view geometry, unlike PCA of
+    the mean points which picks the lateral axis in short wide views) and
+    projects each vehicle's mean position onto the perpendicular. The lateral
+    range is a few lane widths at any site, so bins become scene-independent.
+    Straight-axis projection blurs on strongly curved roads; still strictly
+    better than mean-x, which blurs on ALL non-axis-aligned roads.
+
+    Returns (lateral, valid_mask) aligned to the inputs, or (None, None) when
+    no reliable axis exists (caller falls back to the legacy mean-x path).
+    """
+    mean_lat = np.asarray(mean_lat, dtype=float)
+    mean_lon = np.asarray(mean_lon, dtype=float)
+    first_lat = np.asarray(first_lat, dtype=float)
+    first_lon = np.asarray(first_lon, dtype=float)
+    last_lat = np.asarray(last_lat, dtype=float)
+    last_lon = np.asarray(last_lon, dtype=float)
+
+    valid = (np.isfinite(mean_lat) & np.isfinite(mean_lon)
+             & np.isfinite(first_lat) & np.isfinite(first_lon)
+             & np.isfinite(last_lat) & np.isfinite(last_lon))
+    if valid.sum() < 3:
+        return None, None
+
+    M_LAT = 111_320.0
+    lat0 = float(np.mean(mean_lat[valid]))
+    lon0 = float(np.mean(mean_lon[valid]))
+    m_lon = M_LAT * np.cos(np.deg2rad(lat0))
+
+    mx = (mean_lat - lat0) * M_LAT
+    my = (mean_lon - lon0) * m_lon
+    dx = (last_lat - first_lat) * M_LAT
+    dy = (last_lon - first_lon) * m_lon
+
+    disp = np.hypot(dx, dy)
+    movers = valid & (disp > min_disp_m)
+    if movers.sum() >= 3:
+        ang = np.arctan2(dy[movers], dx[movers])
+        # direction-agnostic circular mean (a lane's two travel directions
+        # must not cancel): average on the doubled angle
+        theta = 0.5 * np.arctan2(np.mean(np.sin(2 * ang)), np.mean(np.cos(2 * ang)))
+    else:
+        # too few moving vehicles for a displacement axis; PCA of the mean
+        # points as a last resort (fine for long views, the common case here)
+        pts = np.stack([mx[valid], my[valid]], axis=1)
+        pts = pts - pts.mean(axis=0)
+        cov = pts.T @ pts / max(len(pts) - 1, 1)
+        evals, evecs = np.linalg.eigh(cov)
+        u = evecs[:, -1]
+        theta = np.arctan2(u[1], u[0])
+
+    lateral = -mx * np.sin(theta) + my * np.cos(theta)
+    lateral[~valid] = np.nan
+    return lateral, valid
+
+
+def lateral_histogram_range(values):
+    """Robust histogram range for lateral offsets: percentile-clipped so one
+    stray outlier (a mis-tracked vehicle) cannot widen the bins back into the
+    lanes-cannot-split regime the lateral coordinate exists to prevent."""
+    lo, hi = np.percentile(values, [1, 99])
+    pad = max(0.5, 0.02 * (hi - lo))
+    return float(lo - pad), float(hi + pad)
+
+
 class SceneFeatureExtractor:
     """Advanced scene feature extraction for meta-learning."""
     
@@ -526,19 +619,35 @@ class SceneFeatureExtractor:
             if gps_df is None or len(gps_df) == 0:
                 return [0.0, 0.0, 0.0]
             df = gps_df if isinstance(gps_df, pl.DataFrame) else pl.DataFrame(gps_df)
-            agg = df.group_by(['contour_id', 'id']).agg(pl.col('x_gps').mean().alias('xm')).drop_nulls()
+            agg = df.group_by(['contour_id', 'id']).agg([
+                pl.col('x_gps').mean().alias('xm'),
+                pl.col('y_gps').mean().alias('ym'),
+                pl.col('x_gps').first().alias('x0'),
+                pl.col('y_gps').first().alias('y0'),
+                pl.col('x_gps').last().alias('x1'),
+                pl.col('y_gps').last().alias('y1'),
+            ]).drop_nulls()
         except Exception:
             return [0.0, 0.0, 0.0]
 
         proms = []
         for cnt in agg['contour_id'].unique().to_list():
-            means = agg.filter(pl.col('contour_id') == cnt)['xm'].to_numpy()
-            # NaN GPS points survive drop_nulls (NaN is not null in polars) and
-            # make np.histogram's range autodetection blow up.
-            means = means[np.isfinite(means)]
+            sub = agg.filter(pl.col('contour_id') == cnt)
+            # lateral (across-road) coordinate, mirroring geo_learning.run; falls
+            # back to raw mean-x when no axis can be estimated
+            lat, valid = lateral_offsets(sub['xm'].to_numpy(), sub['ym'].to_numpy(),
+                                         sub['x0'].to_numpy(), sub['y0'].to_numpy(),
+                                         sub['x1'].to_numpy(), sub['y1'].to_numpy())
+            if lat is not None:
+                means = lat[valid]
+            else:
+                means = sub['xm'].to_numpy()
+                # NaN GPS points survive drop_nulls (NaN is not null in polars) and
+                # make np.histogram's range autodetection blow up.
+                means = means[np.isfinite(means)]
             if len(means) < 3:
                 continue
-            hist, _ = np.histogram(means, bins=50)
+            hist, _ = np.histogram(means, bins=50, range=lateral_histogram_range(means))
             smoothed = gaussian_filter1d(hist.astype(float), sigma=2)
             m = float(smoothed.max())
             if m <= 0:

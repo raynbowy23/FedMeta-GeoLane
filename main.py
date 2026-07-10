@@ -49,9 +49,19 @@ parser.add_argument('--fed_algo', type=str, default='perfedavg', choices=['perfe
                     help='Federated aggregation: perfedavg (meta-init, default), fedavg (mean-regressor ablation), or central (pooled supervised, centralized upper bound). Only affects --model federated.')
 parser.add_argument('--seen_deploy', type=str, default='buffer', choices=['buffer', 'model'],
                     help='Seen-site deployment for --model federated: buffer (best theta from training history, model bypassed) or model (deploy the trained model prediction + calibration). Test whether a recovered model reaches the seen table.')
+parser.add_argument('--seen_clients', type=str, default=None,
+                    help='Comma-separated override of the SEEN training cameras (fleet-scaling experiments). Unseen split unchanged. Example: --seen_clients US12_Monona,US12_Yahara')
 
 args = parser.parse_args()
 print(args)
+
+if args.seen_clients:
+    # Fleet-scaling override: restrict the SEEN training set. All in-module
+    # references read the module global at call time, so reassigning here is
+    # sufficient; the unseen evaluation split is untouched.
+    import geolearning_system as _gls
+    _gls.SEEN_CLIENTS = [c.strip() for c in args.seen_clients.split(',') if c.strip()]
+    print(f"SEEN_CLIENTS override: {_gls.SEEN_CLIENTS}")
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(filename=f'logs/{args.model}_test.log', filemode='w', encoding='utf-8', level=logging.INFO)

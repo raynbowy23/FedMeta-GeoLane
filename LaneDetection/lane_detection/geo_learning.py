@@ -257,15 +257,48 @@ class GeometricLearning:
                 .agg([
                     pl.mean("x_gps").alias("x_mean"),
                     pl.mean("y_gps").alias("y_mean"),
-                    pl.mean("theta_rad").alias("theta_mean")
+                    pl.mean("theta_rad").alias("theta_mean"),
+                    pl.first("x_gps").alias("x_first"),
+                    pl.first("y_gps").alias("y_first"),
+                    pl.last("x_gps").alias("x_last"),
+                    pl.last("y_gps").alias("y_last"),
                 ])
             )
 
-            # Histogram
-            X = trajectory_summary["x_mean"].to_numpy().reshape(-1, 1)
+            # Lane separation coordinate: each vehicle's ACROSS-ROAD offset in
+            # meters (road axis from displacement directions, mean position
+            # projected on the perpendicular). The previous mean-x histogram
+            # mixed lateral offset with longitudinal position, so bin width
+            # scaled with road length in view and find_peaks' 3-bin minimum
+            # distance made 3.5 m lane spacing unresolvable at long-view sites
+            # for every theta. Falls back to mean-x when no axis is estimable.
+            lat_off, lat_valid = lateral_offsets(
+                trajectory_summary["x_mean"].to_numpy(),
+                trajectory_summary["y_mean"].to_numpy(),
+                trajectory_summary["x_first"].to_numpy(),
+                trajectory_summary["y_first"].to_numpy(),
+                trajectory_summary["x_last"].to_numpy(),
+                trajectory_summary["y_last"].to_numpy(),
+            )
+            if lat_off is not None:
+                trajectory_summary = trajectory_summary.with_columns(
+                    pl.Series("lat_off", lat_off)
+                ).filter(pl.Series(lat_valid))
+                X = trajectory_summary["lat_off"].to_numpy().reshape(-1, 1)
+            else:
+                logger.warning(f"{camera_loc} contour {cnts}: no road axis, using legacy mean-x")
+                X = trajectory_summary["x_mean"].to_numpy().reshape(-1, 1)
+                X = X[np.isfinite(X[:, 0])].reshape(-1, 1)
+                trajectory_summary = trajectory_summary.filter(
+                    pl.col("x_mean").is_finite()
+                )
 
-            hist_vals, bin_edges = np.histogram(X, bins=50)
-            # hist_vals, bin_edges = np.histogram(X, bins=50)
+            if len(X) < 3:
+                lane_num_list.append(0)
+                logger.info("Estimated number of lanes: 0 (too few valid vehicles)")
+                continue
+
+            hist_vals, bin_edges = np.histogram(X, bins=50, range=lateral_histogram_range(X[:, 0]))
             if 'sigma' in self.theta:
                 smoothed_hist = self.gaussian_filter(hist_vals, window_size=5, sigma=self.theta['sigma'].item() if isinstance(self.theta['sigma'], torch.Tensor) else self.theta['sigma'])
             else:

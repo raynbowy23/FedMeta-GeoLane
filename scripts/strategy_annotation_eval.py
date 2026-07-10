@@ -27,9 +27,9 @@ from adaptation_curve import (BASELINE_THETA, build_args, build_processed, evalu
                               load_annotation_lanes, annotation_gps, _to_m, M_LAT)
 from LaneDetection.lane_detection.geo_learning import GeometricLearning
 
-SEEN = ['US12_Todd', 'US12_Monona', 'US12_Yahara', 'US12_Stoughton',
-        'US12_CountyAB', 'US12_Mineral', 'US12_University']
-FED_CKPT = 'results/federated/training_results/federated_model_perfedavg.pth'
+SEEN = ['US12_Todd', 'US12_Monona', 'US12_Yahara',
+        'US12_CountyAB', 'US12_Mineral', 'US12_University']  # Stoughton removed from split 2026-07-09
+FED_CKPT = 'results/federated/training_results/federated_model.pth'
 
 
 def deployed_theta(strategy, cam, fed_ckpt=FED_CKPT, meta_dir='results/meta/training_results'):
