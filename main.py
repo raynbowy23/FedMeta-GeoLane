@@ -45,6 +45,10 @@ parser.add_argument('--federated', action='store_true', help='Use federated meta
 parser.add_argument('--fed_rounds', type=int, default=100, help='Number of federated learning rounds')
 parser.add_argument('--client_selection_ratio', type=float, default=0.8, help='Ratio of clients to select per round')
 parser.add_argument('--meta_lr', type=float, default=1e-3, help='Learning rate for meta-model')
+parser.add_argument('--fed_algo', type=str, default='perfedavg', choices=['perfedavg', 'fedavg', 'central'],
+                    help='Federated aggregation: perfedavg (meta-init, default), fedavg (mean-regressor ablation), or central (pooled supervised, centralized upper bound). Only affects --model federated.')
+parser.add_argument('--seen_deploy', type=str, default='buffer', choices=['buffer', 'model'],
+                    help='Seen-site deployment for --model federated: buffer (best theta from training history, model bypassed) or model (deploy the trained model prediction + calibration). Test whether a recovered model reaches the seen table.')
 
 args = parser.parse_args()
 print(args)

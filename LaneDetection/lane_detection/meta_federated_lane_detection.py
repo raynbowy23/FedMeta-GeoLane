@@ -24,6 +24,30 @@ from .utils import (FederatedConfig, SceneFeatureExtractor, perturb_theta, no_de
 
 logger = logging.getLogger(__name__)
 
+# ---- Federated aggregation algorithm ----
+# 'fedavg'    : plain sample-weighted parameter averaging of locally MSE-fit
+#               regressors. Provably regresses the global model toward the
+#               population mean of best_theta (amplitude compression) -> the old
+#               behaviour, kept as an ablation.
+# 'perfedavg' : first-order Per-FedAvg (Fallah et al., NeurIPS 2020). The global
+#               model is trained to be a good INITIALIZATION that reaches each
+#               site's scene->theta mapping in one local adaptation step, which
+#               is the actual federated-meta-learning objective and what the
+#               deployment / adaptation-curve evaluation adapts from.
+# 'central'   : pooled supervised regression. All clients' (scene_features ->
+#               best_theta) pairs are trained into the ONE shared model directly.
+#               Unlike fedavg -- where each client fits only its own near-constant
+#               features and learns a constant, so averaging collapses amplitude --
+#               pooled training sees the cross-camera variation and can learn the
+#               scene->theta slope the features carry. Centralized upper bound for
+#               the federated method; used to test whether the FedAvg/Per-FedAvg
+#               amplitude collapse is the aggregation (fixable) or a feature limit.
+PERFEDAVG_INNER_LR = 1e-2     # alpha: local adaptation step size
+PERFEDAVG_OUTER_LR = 1e-2     # beta: server meta-gradient step size
+PERFEDAVG_INNER_STEPS = 1     # gradient steps taken from the global init per client
+DEPLOYMENT_ADAPT_STEPS = 1    # gradient steps taken at an unseen site before predicting
+CENTRAL_EPOCHS = 10           # supervised passes over the pooled buffer per round ('central')
+
 
 def _scalarize(t):
     # robustly get a scalar tensor from model outputs that may have shape [B] or [B,1] or []
@@ -148,9 +172,17 @@ class FederatedMetaLearner:
     """
     Orchestrates federated learning across multiple camera clients with meta-learning.
     """
-    def __init__(self, meta_model, device='cpu', visualize_lanes=True):
+    def __init__(self, meta_model, device='cpu', visualize_lanes=True, fed_algo='perfedavg',
+                 seen_deploy='buffer'):
         self.meta_model = meta_model.to(device)
         self.device = device
+        # 'perfedavg' (meta-init, default), 'fedavg' (mean-regressor ablation), or
+        # 'central' (pooled supervised, centralized upper bound).
+        self.fed_algo = fed_algo
+        # Seen-site deployment: 'buffer' reuses the best black-box theta from the
+        # site's training history (model bypassed); 'model' deploys the trained
+        # model's prediction + calibration, so a recovered model can reach seen.
+        self.seen_deploy = seen_deploy
         self.client_data_buffer = defaultdict(list)
         self.global_data_buffer = []
         self.training_history = []
@@ -315,10 +347,14 @@ class FederatedMetaLearner:
             calibrate = False
             if client_id in self.deployment_theta:
                 predicted_theta_values = self.deployment_theta[client_id]
-            elif self.client_data_buffer.get(client_id):
+            elif self.seen_deploy == 'buffer' and self.client_data_buffer.get(client_id):
                 predicted_theta_values = self._best_theta_from_buffer(client_id)
                 self.deployment_theta[client_id] = predicted_theta_values
             else:
+                # seen_deploy=='model' routes seen sites through the trained model
+                # too (predict + on-arrival calibration), so the recovered global
+                # model can actually reach the seen table instead of being bypassed
+                # by the buffer. Unseen always lands here.
                 with torch.no_grad():
                     predicted_theta = self.meta_model(scene_features)
                     predicted_theta_values = {}
@@ -349,6 +385,30 @@ class FederatedMetaLearner:
                         if trial_score(c_loss, c_metrics) < best_score:
                             best_score = trial_score(c_loss, c_metrics)
                             best_loss, best_theta, metrics = c_loss, cand, c_metrics
+
+                    # Meta-init cash-in: adapt the global model one step on the
+                    # site's own calibration evidence and try its prediction. The
+                    # black-box budget above is identical to Meta's; the only
+                    # difference is that Per-FedAvg's init was trained to be
+                    # adaptable, so this candidate only wins when the init is good.
+                    if self.fed_algo == 'perfedavg':
+                        support = [{'x': scene_features.to(self.device), 'y': best_theta}]
+                        try:
+                            adapted = self._adapt_from_global(support)
+                            with torch.no_grad():
+                                a_pred = adapted(scene_features)
+                                a_theta = {k: (v.item() if v.dim() == 0 else v.squeeze().item())
+                                           for k, v in a_pred.items()}
+                            for k, v in a_theta.items():
+                                geo_learning.theta[k] = torch.tensor(v)
+                            a_loss, a_metrics = self._run_geo_learning(geo_learning, processed_data, client_id)
+                            if trial_score(a_loss, a_metrics) < best_score:
+                                best_score = trial_score(a_loss, a_metrics)
+                                best_loss, best_theta, metrics = a_loss, a_theta, a_metrics
+                                logger.info(f"[Deploy] {client_id}: meta-init adaptation improved theta")
+                        except Exception as e:
+                            logger.error(f"Meta-init adaptation failed for {client_id}: {e}")
+
                     self.deployment_theta[client_id] = best_theta
                     logger.info(f"[Deploy] {client_id}: test-time calibration done (prominence {best_theta.get('peak_prominence', float('nan')):.3f})")
             except Exception as e:
@@ -419,6 +479,138 @@ class FederatedMetaLearner:
 
         return local_meta.state_dict(), len(samples)
 
+    # ---------------- Per-FedAvg (meta-init) ----------------
+
+    def _theta_mse(self, model, samples):
+        """Mean MSE over the real theta params (skipping weight_*) for a list of
+        {'x': scene_features, 'y': best_theta dict} samples."""
+        mse = nn.MSELoss()
+        total = 0.0
+        for s in samples:
+            pred = model(s['x'])
+            for k, p in pred.items():
+                if k.startswith('weight_'):
+                    continue
+                tgt = torch.tensor(float(s['y'][k]), dtype=torch.float32, device=self.device)
+                total = total + mse(_scalarize(p), tgt)
+        return total / max(len(samples), 1)
+
+    def _client_samples(self, client_id):
+        """Flatten a client's buffer into [{'x': scene_features, 'y': best_theta}]."""
+        out = []
+        for entry in self.client_data_buffer.get(client_id, []):
+            if entry.get('best_theta') is None:
+                continue
+            out.append({'x': entry['scene_features'].to(self.device),
+                        'y': entry['best_theta']})
+        return out
+
+    def _client_meta_gradient(self, client_id, global_state,
+                              inner_lr=PERFEDAVG_INNER_LR, inner_steps=PERFEDAVG_INNER_STEPS):
+        """First-order Per-FedAvg meta-gradient for one client.
+
+        Adapt a local copy from the global init on a support split, then return
+        the gradient of the query loss evaluated AT the adapted parameters (the
+        first-order approximation drops the Hessian term). With fewer than two
+        buffered samples the support/query split is impossible, so fall back to a
+        Reptile pseudo-gradient (init - adapted) that points the same way and lets
+        early rounds still contribute.
+
+        Returns (grad_dict keyed by named_parameters, num_samples) or (None, 0).
+        """
+        samples = self._client_samples(client_id)
+        if not samples:
+            return None, 0
+
+        local = copy.deepcopy(self.meta_model).to(self.device)
+        local.load_state_dict(global_state)
+        local.train()
+
+        if len(samples) >= 2:
+            random.shuffle(samples)
+            split = max(1, len(samples) // 2)
+            support, query = samples[:split], samples[split:]
+            inner_opt = torch.optim.SGD(local.parameters(), lr=inner_lr)
+            for _ in range(inner_steps):
+                inner_opt.zero_grad()
+                self._theta_mse(local, support).backward()
+                inner_opt.step()
+            local.zero_grad()
+            self._theta_mse(local, query).backward()
+            grad = {n: (p.grad.detach().clone() if p.grad is not None
+                        else torch.zeros_like(p))
+                    for n, p in local.named_parameters()}
+        else:
+            inner_opt = torch.optim.SGD(local.parameters(), lr=inner_lr)
+            for _ in range(max(inner_steps, 2)):
+                inner_opt.zero_grad()
+                self._theta_mse(local, samples).backward()
+                inner_opt.step()
+            adapted = dict(local.named_parameters())
+            grad = {n: (global_state[n] - adapted[n].detach()).clone()
+                    for n in adapted}
+        return grad, len(samples)
+
+    def _perfedavg_update(self, selected_clients,
+                          inner_lr=PERFEDAVG_INNER_LR, inner_steps=PERFEDAVG_INNER_STEPS,
+                          outer_lr=PERFEDAVG_OUTER_LR):
+        """Server Per-FedAvg step: aggregate client meta-gradients, step the global
+        model so one local adaptation step reaches each site's scene->theta map."""
+        global_state = copy.deepcopy(self.meta_model.state_dict())
+        grads, sizes = [], []
+        for cid in selected_clients:
+            g_i, n_i = self._client_meta_gradient(cid, global_state, inner_lr, inner_steps)
+            if g_i is not None and n_i > 0:
+                grads.append(g_i)
+                sizes.append(n_i)
+        if not grads:
+            logger.warning("No client meta-gradients available for Per-FedAvg step.")
+            return
+        N = float(sum(sizes))
+        new_state = copy.deepcopy(global_state)
+        for name in grads[0]:
+            agg = sum((n / N) * g[name] for g, n in zip(grads, sizes))
+            new_state[name] = new_state[name] - outer_lr * agg
+        self.meta_model.load_state_dict(new_state)
+        logger.info(f"Per-FedAvg meta update: aggregated meta-gradients from {len(grads)} clients")
+
+    def _central_supervised_update(self, selected_clients, epochs=CENTRAL_EPOCHS, lr=1e-3):
+        """Pool every client's (scene_features -> best_theta) pairs and train the
+        one shared model directly (centralized supervised meta-learning). FedAvg
+        of per-client fits never sees cross-camera input variation and collapses
+        to a constant; pooled training exposes the scene->theta slope."""
+        samples = []
+        for cid in selected_clients:
+            samples.extend(self._client_samples(cid))
+        if not samples:
+            logger.warning("No pooled samples for central supervised update.")
+            return
+        self.meta_model.train()
+        opt = torch.optim.Adam(self.meta_model.parameters(), lr=lr)
+        for _ in range(epochs):
+            random.shuffle(samples)
+            for s in samples:
+                loss = self._theta_mse(self.meta_model, [s])
+                opt.zero_grad()
+                loss.backward()
+                opt.step()
+        logger.info(f"Central supervised update: trained shared model on {len(samples)} pooled samples "
+                    f"from {len(selected_clients)} clients")
+
+    def _adapt_from_global(self, support_samples,
+                           inner_lr=PERFEDAVG_INNER_LR, inner_steps=DEPLOYMENT_ADAPT_STEPS):
+        """Return a copy of the global meta-model adapted a few gradient steps on a
+        site's locally generated (scene -> best_theta) samples. This is how an
+        unseen site cashes in the meta-init and what the adaptation curve measures."""
+        local = copy.deepcopy(self.meta_model).to(self.device)
+        local.train()
+        opt = torch.optim.SGD(local.parameters(), lr=inner_lr)
+        for _ in range(inner_steps):
+            opt.zero_grad()
+            self._theta_mse(local, support_samples).backward()
+            opt.step()
+        local.eval()
+        return local
 
     def _run_geo_learning(self, geo_learning, processed_data, client_id):
         """Execute geometric learning and compute loss."""
@@ -618,9 +810,15 @@ class FederatedMetaLearner:
                     ax2.plot(data["right"][:, 0], data["right"][:, 1], 
                             color=color, linewidth=2.0, linestyle='--', alpha=0.7)
 
-                sumo_lane_id = list(sumo_lane_shape.keys())[cluster_to_edge_map[lane_id][1]]
-                # This cnt should be valid contour id (some of them start from 2 and 3)
-                # print(cnt_id, lane_id, sumo_lane_id)
+                # Map the detected cluster back to a SUMO lane id for the saved CSV.
+                # A cluster without an edge mapping (e.g. an extra detected lane
+                # beyond the reference count) or an out-of-range index has no SUMO
+                # id; skip the labeling for it rather than crash the whole client.
+                sumo_keys = list(sumo_lane_shape.keys())
+                edge = cluster_to_edge_map.get(lane_id)
+                if edge is None or not (0 <= edge[1] < len(sumo_keys)):
+                    continue
+                sumo_lane_id = sumo_keys[edge[1]]
                 traj_df_pd.loc[
                     (traj_df_pd["contour_id"] == cnt_id) & (traj_df_pd["clustered_id"] == lane_id),
                     "lane_id"
@@ -723,6 +921,22 @@ class FederatedMetaLearner:
         Federated update of the meta_model across selected clients.
         Uses each client's local buffers produced in client_update().
         """
+        if self.fed_algo == 'central':
+            # Pooled supervised regression: does the shared model recover the
+            # per-scene signal that FedAvg/Per-FedAvg collapse?
+            self._central_supervised_update(selected_clients, epochs=CENTRAL_EPOCHS, lr=lr)
+            return
+
+        if self.fed_algo == 'perfedavg':
+            # Meta-init objective: train the global model to be adapted in one
+            # local step, rather than to predict the population-mean theta.
+            self._perfedavg_update(selected_clients,
+                                   inner_lr=PERFEDAVG_INNER_LR,
+                                   inner_steps=PERFEDAVG_INNER_STEPS,
+                                   outer_lr=PERFEDAVG_OUTER_LR)
+            return
+
+        # ---- plain FedAvg (mean-regressor ablation) ----
         # 1) broadcast current global meta-model
         global_state = copy.deepcopy(self.meta_model.state_dict())
 

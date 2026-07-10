@@ -108,7 +108,11 @@ class GeoLearningSystem:
             num_theta_params=5
         ).to(self.device)
         
-        self.fed_learner = FederatedMetaLearner(self.meta_model, self.device)
+        self.fed_learner = FederatedMetaLearner(
+            self.meta_model, self.device,
+            fed_algo=getattr(self.args, 'fed_algo', 'perfedavg'),
+            seen_deploy=getattr(self.args, 'seen_deploy', 'buffer'),
+        )
         self.client_selection_ratio = 0.8
         
         logger.info("Initialized federated strategy")
