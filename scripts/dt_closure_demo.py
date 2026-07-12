@@ -139,10 +139,13 @@ def map_lanes_to_net(net, lanes):
             lanes[i]['exact'] = exact
 
 
-def run_sim(sumocfg, sim_end, seed, closed_lane=None, sample_every=10, watch_edge=None, scale=1.0):
+def run_sim(sumocfg, sim_end, seed, closed_lane=None, sample_every=10, watch_edge=None, scale=1.0,
+            tripinfo=None):
     cmd = ['sumo', '-c', str(sumocfg), '--seed', str(seed), '--end', str(sim_end),
            '--scale', str(scale),
            '--no-warnings', 'true', '--no-step-log', 'true', '--duration-log.disable', 'true']
+    if tripinfo:
+        cmd += ['--tripinfo-output', str(tripinfo)]
     traci.start(cmd)
     if closed_lane is not None:
         traci.lane.setAllowed(closed_lane, [])  # allow nothing = closed
@@ -155,10 +158,21 @@ def run_sim(sumocfg, sim_end, seed, closed_lane=None, sample_every=10, watch_edg
             speeds.append(traci.edge.getLastStepMeanSpeed(watch_edge))
             waiting.append(traci.edge.getWaitingTime(watch_edge))
     traci.close()
-    return dict(mean_speed=float(np.mean([s for s in speeds if s >= 0]) if speeds else np.nan),
-                arrived=int(arrived),
-                mean_waiting=float(np.mean(waiting)) if waiting else 0.0,
-                n_samples=len(speeds))
+    out = dict(mean_speed=float(np.mean([s for s in speeds if s >= 0]) if speeds else np.nan),
+               arrived=int(arrived),
+               mean_waiting=float(np.mean(waiting)) if waiting else 0.0,
+               n_samples=len(speeds))
+    if tripinfo and Path(tripinfo).exists():
+        # per-vehicle consequences: the closure shows up as time lost network
+        # wide (rerouting, slower merges), which edge point-samples miss
+        import xml.etree.ElementTree as ET
+        tis = ET.parse(tripinfo).getroot().findall('tripinfo')
+        if tis:
+            out['mean_duration_s'] = float(np.mean([float(t.get('duration')) for t in tis]))
+            out['mean_timeloss_s'] = float(np.mean([float(t.get('timeLoss')) for t in tis]))
+            out['mean_departdelay_s'] = float(np.mean([float(t.get('departDelay')) for t in tis]))
+            out['n_tripinfo'] = len(tis)
+    return out
 
 
 def main():
@@ -229,11 +243,14 @@ def main():
     watch_edge = closed['sumo'].rsplit('_', 1)[0]
     sumocfg = net_dir / 'osm.sumocfg'
     print(f'\nSimulating {opts.sim_end}s (seed {opts.seed}), watching edge {watch_edge} ...')
-    before = run_sim(sumocfg, opts.sim_end, opts.seed, closed_lane=None, watch_edge=watch_edge, scale=opts.scale)
-    after = run_sim(sumocfg, opts.sim_end, opts.seed, closed_lane=closed['sumo'], watch_edge=watch_edge, scale=opts.scale)
-    print(f"{'':12}{'mean speed m/s':>15}{'arrived veh':>13}{'mean wait s':>13}")
-    print(f"{'before':<12}{before['mean_speed']:>15.2f}{before['arrived']:>13}{before['mean_waiting']:>13.1f}")
-    print(f"{'after':<12}{after['mean_speed']:>15.2f}{after['arrived']:>13}{after['mean_waiting']:>13.1f}")
+    before = run_sim(sumocfg, opts.sim_end, opts.seed, closed_lane=None, watch_edge=watch_edge, scale=opts.scale, tripinfo=out / 'tripinfo_before.xml')
+    after = run_sim(sumocfg, opts.sim_end, opts.seed, closed_lane=closed['sumo'], watch_edge=watch_edge, scale=opts.scale, tripinfo=out / 'tripinfo_after.xml')
+    print(f"{'':12}{'speed m/s':>10}{'arrived':>9}{'trip s':>8}{'timeloss s':>11}{'dep delay s':>12}")
+    for tag, m in [('before', before), ('after', after)]:
+        print(f"{tag:<12}{m['mean_speed']:>10.2f}{m['arrived']:>9}"
+              f"{m.get('mean_duration_s', float('nan')):>8.1f}"
+              f"{m.get('mean_timeloss_s', float('nan')):>11.1f}"
+              f"{m.get('mean_departdelay_s', float('nan')):>12.1f}")
 
     # ---- artifacts ----
     result = dict(camera=cam, closed_detected_lane=ci, closed_vehicle_count=len(closed['ids']),

@@ -147,7 +147,31 @@ class GeometricLearning:
                 c_u = np.bincount(inv, weights=across) / np.bincount(inv)
                 line_res = c_u - np.polyval(np.polyfit(a_u, c_u, 1), a_u)
                 ssr_line = float(np.sum(line_res ** 2))
-                s_budget = max((smoothing / 20.0) * ssr_line, 0.01 * len(a_u))
+                # Maximally smoothed reference fit (also the width estimator's
+                # reference below). Computed first so its residuals give a robust
+                # noise-scale estimate for the budget floor.
+                width_spline = UnivariateSpline(a_u, c_u, s=max(ssr_line, 0.01 * len(a_u)))
+                # NOISE FLOOR for the smoothing budget. Anchoring the budget only
+                # as a fraction of the line-fit SSR under-smooths on STRAIGHT
+                # roads, where the line SSR is pure noise: a mid smoothing value
+                # then licenses the spline to chase half the noise variance,
+                # producing multi-meter sawtooth centerlines exactly where the
+                # road is straightest (measured at I43_Walnut). Floor the budget
+                # at n * sigma^2 so the spline may track real curvature below the
+                # line fit but never noise below the noise floor. sigma comes from
+                # a DIFFERENCE-BASED estimator: half the sum of squared
+                # successive differences of the per-along means estimates the
+                # TOTAL noise SSR (E[diff^2] = sigma_i^2 + sigma_{i+1}^2 for
+                # independent bins), which is exactly the quantity the budget
+                # floor needs and is correct under the heteroscedastic bin
+                # counts (a median-based sigma misses the noisy-bin tail and
+                # under-floors). Differencing annihilates the smooth
+                # road-geometry component, so curvature does NOT inflate the
+                # floor -- estimating noise from residuals against a line-level
+                # reference would, and would freeze the smoothing range on
+                # curved roads.
+                s_noise = 0.5 * float(np.sum(np.diff(c_u) ** 2))
+                s_budget = max((smoothing / 20.0) * ssr_line, s_noise, 0.01 * len(a_u))
                 spline = UnivariateSpline(a_u, c_u, s=s_budget)
                 along_fit = np.linspace(a_u.min(), a_u.max(), num=num_points)
                 across_fit = spline(along_fit)
@@ -167,11 +191,10 @@ class GeometricLearning:
                 # road), inflating widths to tens of meters. p95-p5 of the
                 # perpendicular offsets covers ~90% of a uniform across-lane
                 # distribution and is robust to outliers.
-                # Residuals are taken against a maximally smoothed reference fit
-                # (full line-SSR budget), NOT the theta-smoothed spline above: a
-                # low smoothing_factor lets the centerline wiggle into the
+                # Residuals are taken against the maximally smoothed reference fit
+                # computed above, NOT the theta-smoothed spline: a low
+                # smoothing_factor lets the centerline wiggle into the
                 # across-lane spread, which would silently absorb the width.
-                width_spline = UnivariateSpline(a_u, c_u, s=max(ssr_line, 0.01 * len(a_u)))
                 slope = width_spline.derivative()(along)
                 perp = (across - width_spline(along)) / np.sqrt(1.0 + slope ** 2)
                 lane_width = float(np.percentile(perp, 95) - np.percentile(perp, 5))

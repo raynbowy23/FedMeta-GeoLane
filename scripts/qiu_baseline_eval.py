@@ -59,9 +59,32 @@ def polyline_from_boundaries(lane_dict, W, H):
     return np.array(pts, dtype=float)
 
 
-def run_qiu(cam, qiu_path, workdir, n_cycles=3, debug=False):
+def boundaries_from_lane(lane_dict, W, H):
+    """One Qiu lane dict -> (center, left, right) pixel polylines, in-frame
+    rows only (their per-ROI polynomials extrapolate wildly outside)."""
+    c, l, r = [], [], []
+    for y, b in lane_dict.items():
+        try:
+            yv = float(y)
+            if not (0 <= yv < H) or not isinstance(b, dict):
+                continue
+            lx, rx = b.get('left_boundary_x'), b.get('right_boundary_x')
+            if lx is None or rx is None:
+                continue
+            lx, rx = float(lx), float(rx)
+            if not (0 <= lx <= W and 0 <= rx <= W):
+                continue
+            c.append(((lx + rx) / 2.0, yv)); l.append((lx, yv)); r.append((rx, yv))
+        except (TypeError, ValueError):
+            continue
+    srt = lambda P: np.array(sorted(P, key=lambda p: p[1]), dtype=float)
+    return srt(c), srt(l), srt(r)
+
+
+def run_qiu(cam, qiu_path, workdir, n_cycles=3, debug=False, return_boundaries=False):
     """Replay their cycle protocol on our saved detections. Returns a list of
-    centerline pixel polylines, or raises on failure."""
+    centerline pixel polylines (or {center,left,right} dicts when
+    return_boundaries=True), or raises on failure."""
     sys.path.insert(0, str(qiu_path))
     import matplotlib
     matplotlib.use('Agg')
@@ -104,9 +127,14 @@ def run_qiu(cam, qiu_path, workdir, n_cycles=3, debug=False):
     items = lane_boundaries.values() if isinstance(lane_boundaries, dict) else lane_boundaries
     for lane in items:
         if isinstance(lane, dict):
-            P = polyline_from_boundaries(lane, W, H)
-            if len(P) >= 2:
-                polylines.append(P)
+            if return_boundaries:
+                c, l, r = boundaries_from_lane(lane, W, H)
+                if len(c) >= 2:
+                    polylines.append(dict(center=c, left=l, right=r))
+            else:
+                P = polyline_from_boundaries(lane, W, H)
+                if len(P) >= 2:
+                    polylines.append(P)
     return polylines
 
 
