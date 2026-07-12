@@ -117,9 +117,10 @@ def main():
     ap.add_argument('--taus', type=float, nargs='+', default=[3.0, 5.0])
     ap.add_argument('--n_cycles', type=int, default=3)
     ap.add_argument('--debug', action='store_true')
+    ap.add_argument('--out', default='results/qiu_baseline', help='output dir (diagnostic runs must NOT clobber the canonical CSV)')
     opts = ap.parse_args()
     args = build_args()
-    workdir = Path('results/qiu_baseline'); workdir.mkdir(parents=True, exist_ok=True)
+    workdir = Path(opts.out); workdir.mkdir(parents=True, exist_ok=True)
 
     rows = []
     for cam in opts.cameras:
@@ -133,7 +134,7 @@ def main():
             if opts.debug:
                 import traceback; traceback.print_exc()
             rows.append(dict(camera=cam, split='seen' if cam in SEEN else 'unseen',
-                             tau=np.nan, precision=0, recall=0, f1=0, tp=0, n_det=0,
+                             tau=np.nan, precision=0, recall=0, f1=0, geo_err_tp=np.nan, tp=0, n_det=0,
                              n_ann=len(ann_px), note=f'failed:{type(e).__name__}'))
             continue
         # pixel -> GPS through the site homography (same as annotations/detections)
@@ -150,7 +151,7 @@ def main():
         for tau in opts.taus:
             p, r, f, g, tp, nd, na = prf(det_m, ann_m, tau)
             rows.append(dict(camera=cam, split='seen' if cam in SEEN else 'unseen', tau=tau,
-                             precision=p, recall=r, f1=f, tp=tp, n_det=nd, n_ann=na, note=''))
+                             precision=p, recall=r, f1=f, geo_err_tp=g, tp=tp, n_det=nd, n_ann=na, note=''))
             print(f'{cam:<16} tau={tau:.0f}  P={p:.2f} R={r:.2f} F1={f:.2f}  det={nd} ann={na}')
 
     with open(workdir / 'qiu_baseline_eval.csv', 'w', newline='') as fh:
