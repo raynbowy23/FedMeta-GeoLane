@@ -11,10 +11,12 @@ logger = logging.getLogger(__name__)
 from sklearn.cluster import KMeans
 from scipy.signal import find_peaks
 from scipy.interpolate import UnivariateSpline
+from scipy.optimize import linear_sum_assignment
 import polars as pl
 
 from .utils import *
 from .loss import *
+from LaneDetection.osm_extraction.utils import interpolate_edge
 
 
 class GeometricLearning:
@@ -40,6 +42,8 @@ class GeometricLearning:
             'triplet_margin': torch.tensor(0.8),
             'smoothing_factor': torch.tensor(10.0),
             'sigma': torch.tensor(2.0),
+            'peak_prominence': torch.tensor(0.5),
+            'min_lane_evidence': torch.tensor(1.0),  # gate off by default (neutral)
         }
 
         self.colors = [
@@ -77,13 +81,6 @@ class GeometricLearning:
         kernel /= kernel.sum()
         return np.convolve(data, kernel, mode='same')
 
-    def estimate_lane_width(self, lane_df):
-        """
-        Estimate width from trajectory spread (x spread for vertical lanes).
-        """
-        x = lane_df["x_gps"].values
-        width_est = 2 * np.std(x) # ~95% coverage if Gaussian
-        return width_est
 
     def compute_lane_geometry(self, df_plot, smoothing=10, num_points=30):
         """
@@ -116,32 +113,109 @@ class GeometricLearning:
             y = lane_df_sorted["y_gps"].values
 
             try:
-                # Fit spline
-                spline = UnivariateSpline(y, x, s=smoothing)
-                y_fit = np.linspace(y.min(), y.max(), num=num_points)
-                x_fit = spline(y_fit)
+                # Fit the spline in local meter coordinates. s is a squared-residual
+                # budget, so in raw GPS degrees (residuals ~1e-5) any s >= ~1e-6
+                # collapses to one maximally smoothed curve and the meta-learned
+                # smoothing_factor has no effect at all. In meters, s in [1, 20]
+                # spans tight-to-smooth fits as intended. x_gps is latitude and
+                # y_gps is longitude in this pipeline.
+                lat0, lon0 = float(np.mean(x)), float(np.mean(y))
+                m_lat = 111_320.0
+                m_lon = 111_320.0 * np.cos(np.deg2rad(lat0))
+                y_m = (y - lon0) * m_lon
+                x_m = (x - lat0) * m_lat
 
-                # Estimate lane width
-                lane_width = self.estimate_lane_width(lane_df)
+                # Rotate to the lane's principal axis so "along" and "across" are
+                # well defined for ANY road orientation. Fitting lat = f(lon)
+                # directly is only valid for roughly east-west roads; on a
+                # north-south road the roles swap and both the centerline fit and
+                # any width estimate silently degenerate.
+                cov = np.cov(np.stack([y_m, x_m]))
+                ang = 0.5 * np.arctan2(2.0 * cov[0, 1], cov[0, 0] - cov[1, 1])
+                ca, sa = np.cos(ang), np.sin(ang)
+                along = ca * y_m + sa * x_m
+                across = -sa * y_m + ca * x_m
+
+                # Many points can share one along value, and that within-group
+                # variance is an irreducible residual no spline can undercut, so
+                # fitpack diverges for any budget below it. Fit the per-along mean
+                # (the spline's target is the conditional mean anyway) and anchor
+                # the budget to its straight-line fit residual: smoothing 20 ->
+                # line-fit smoothing (fewest knots), 1 -> follows curvature.
+                a_u, inv = np.unique(along, return_inverse=True)
+                if len(a_u) < 5:
+                    continue
+                c_u = np.bincount(inv, weights=across) / np.bincount(inv)
+                line_res = c_u - np.polyval(np.polyfit(a_u, c_u, 1), a_u)
+                ssr_line = float(np.sum(line_res ** 2))
+                # Maximally smoothed reference fit (also the width estimator's
+                # reference below). Computed first so its residuals give a robust
+                # noise-scale estimate for the budget floor.
+                width_spline = UnivariateSpline(a_u, c_u, s=max(ssr_line, 0.01 * len(a_u)))
+                # NOISE FLOOR for the smoothing budget. Anchoring the budget only
+                # as a fraction of the line-fit SSR under-smooths on STRAIGHT
+                # roads, where the line SSR is pure noise: a mid smoothing value
+                # then licenses the spline to chase half the noise variance,
+                # producing multi-meter sawtooth centerlines exactly where the
+                # road is straightest (measured at I43_Walnut). Floor the budget
+                # at n * sigma^2 so the spline may track real curvature below the
+                # line fit but never noise below the noise floor. sigma comes from
+                # a DIFFERENCE-BASED estimator: half the sum of squared
+                # successive differences of the per-along means estimates the
+                # TOTAL noise SSR (E[diff^2] = sigma_i^2 + sigma_{i+1}^2 for
+                # independent bins), which is exactly the quantity the budget
+                # floor needs and is correct under the heteroscedastic bin
+                # counts (a median-based sigma misses the noisy-bin tail and
+                # under-floors). Differencing annihilates the smooth
+                # road-geometry component, so curvature does NOT inflate the
+                # floor -- estimating noise from residuals against a line-level
+                # reference would, and would freeze the smoothing range on
+                # curved roads.
+                s_noise = 0.5 * float(np.sum(np.diff(c_u) ** 2))
+                s_budget = max((smoothing / 20.0) * ssr_line, s_noise, 0.01 * len(a_u))
+                spline = UnivariateSpline(a_u, c_u, s=s_budget)
+                along_fit = np.linspace(a_u.min(), a_u.max(), num=num_points)
+                across_fit = spline(along_fit)
+                if not np.all(np.isfinite(across_fit)):
+                    logger.warning(f"Lane {lane_id}: spline produced non-finite values, skipping lane")
+                    continue
+                # Back-rotate the fitted centerline to the meter frame, then to GPS
+                y_fit_m = ca * along_fit - sa * across_fit
+                x_fit_m = sa * along_fit + ca * across_fit
+                y_fit = y_fit_m / m_lon + lon0
+                x_fit = x_fit_m / m_lat + lat0
+
+                # Robust lateral width in meters from the perpendicular spread of
+                # trajectory points around the fitted centerline. The old
+                # 2*std(x_gps) heuristic measured the road's LENGTH component for
+                # any road not running exactly east-west (latitude varies along the
+                # road), inflating widths to tens of meters. p95-p5 of the
+                # perpendicular offsets covers ~90% of a uniform across-lane
+                # distribution and is robust to outliers.
+                # Residuals are taken against the maximally smoothed reference fit
+                # computed above, NOT the theta-smoothed spline: a low
+                # smoothing_factor lets the centerline wiggle into the
+                # across-lane spread, which would silently absorb the width.
+                slope = width_spline.derivative()(along)
+                perp = (across - width_spline(along)) / np.sqrt(1.0 + slope ** 2)
+                lane_width = float(np.percentile(perp, 95) - np.percentile(perp, 5))
                 if 'width_scale' in self.theta:
                     width_scale = self.theta['width_scale'].item() if isinstance(self.theta['width_scale'], torch.Tensor) else self.theta['width_scale']
                     lane_width *= width_scale
 
-                # Compute direction and normals
-                dx = np.gradient(x_fit)
-                dy = np.gradient(y_fit)
-                norm = np.sqrt(dx**2 + dy**2)
-                dx /= norm
-                dy /= norm
-                nx = -dy
-                ny = dx
+                # Boundaries in the same local meter frame, converted back to GPS
+                dx_m = np.gradient(x_fit_m)
+                dy_m = np.gradient(y_fit_m)
+                norm = np.sqrt(dx_m ** 2 + dy_m ** 2)
+                norm[norm == 0] = 1.0
+                nx = -dy_m / norm
+                ny = dx_m / norm
 
-                # Compute boundaries
                 offset = lane_width / 2
-                x_left = x_fit + nx * offset
-                y_left = y_fit + ny * offset
-                x_right = x_fit - nx * offset
-                y_right = y_fit - ny * offset
+                x_left = (x_fit_m + nx * offset) / m_lat + lat0
+                y_left = (y_fit_m + ny * offset) / m_lon + lon0
+                x_right = (x_fit_m - nx * offset) / m_lat + lat0
+                y_right = (y_fit_m - ny * offset) / m_lon + lon0
 
                 lane_boundaries_by_id[int(lane_id)] = {
                     "center": np.stack([x_fit, y_fit], axis=1),
@@ -156,6 +230,123 @@ class GeometricLearning:
 
         return lane_boundaries_by_id
 
+
+    @staticmethod
+    def _resample_track(P, k=20):
+        d = np.r_[0.0, np.cumsum(np.linalg.norm(np.diff(P, axis=0), axis=1))]
+        if d[-1] <= 0:
+            return None
+        t = np.linspace(0.0, d[-1], k)
+        return np.stack([np.interp(t, d, P[:, 0]), np.interp(t, d, P[:, 1])], axis=1)
+
+    @staticmethod
+    def _cluster_tracks(tracks, tau):
+        """Leader-follower incremental clustering plus k-means refinement under
+        symmetric Hausdorff distance (the trajectory-clustering detector). Returns
+        a cluster label per input track."""
+        from scipy.spatial.distance import directed_hausdorff
+
+        def hd(A, B):
+            return max(directed_hausdorff(A, B)[0], directed_hausdorff(B, A)[0])
+
+        def orient(P, ref):
+            return P if np.dot(P[-1] - P[0], ref[-1] - ref[0]) >= 0 else P[::-1]
+
+        centers, members = [], []
+        for P in tracks:
+            if not centers:
+                centers.append(P.copy()); members.append([P]); continue
+            ds = [hd(P, C) for C in centers]
+            j = int(np.argmin(ds))
+            if ds[j] < tau:
+                members[j].append(orient(P, centers[j]))
+                centers[j] = np.mean(np.stack(members[j]), axis=0)
+            else:
+                centers.append(P.copy()); members.append([P])
+        labels = np.zeros(len(tracks), dtype=int)
+        for _ in range(3):
+            buckets = [[] for _ in centers]
+            for i, P in enumerate(tracks):
+                j = int(np.argmin([hd(P, C) for C in centers]))
+                labels[i] = j
+                buckets[j].append(orient(P, centers[j]))
+            centers = [np.mean(np.stack(b), axis=0) if b else c for b, c in zip(buckets, centers)]
+        return labels, centers
+
+    def run_clustering(self, traj_df, camera_loc, tau_widths=2.0, floor_frac=0.04):
+        """Trajectory-clustering detector. Clusters vehicle tracks globally with a
+        threshold at the physical lane spacing (tau_widths x median vehicle width),
+        assigns each vehicle a lane, then reuses compute_lane_geometry to emit the
+        full anchored lane model (centerlines, widths, boundaries). Drop-in for the
+        histogram path; returns (traj_df_with_clustered_id, {0: lane_boundaries})."""
+        import polars as pl
+        from collections import Counter
+
+        pre = Path('results/preprocess', camera_loc, 'trajectory.csv')
+        df = pl.read_csv(pre)
+        tracks, ids, widths = [], [], []
+        for _, g in sorted(df.group_by('id'), key=lambda kv: kv[1]['frame_num'].min()):
+            if len(g) < 10:
+                continue
+            P = np.stack([g['x'].to_numpy(), g['y'].to_numpy()], axis=1).astype(float)
+            if np.linalg.norm(P[-1] - P[0]) < 60:
+                continue
+            R = self._resample_track(P, 20)
+            if R is not None:
+                tracks.append(R); ids.append(int(g['id'][0])); widths.append(float(np.median(g['w'].to_numpy())))
+        if len(tracks) < 5:
+            logger.warning(f"{camera_loc}: too few tracks for clustering ({len(tracks)})")
+            return traj_df.with_columns(pl.lit(-1, dtype=pl.Int64).alias('clustered_id')), {}
+        tau = tau_widths * float(np.median(widths))
+        labels, centers = self._cluster_tracks(tracks, tau)
+        cnt = Counter(labels.tolist())
+        floor = max(5, int(floor_frac * len(tracks)))
+        keep = sorted(lbl for lbl, c in cnt.items() if c >= floor)
+
+        from LaneDetection.osm_extraction.utils import trajectory_calibration
+        bounds = {}
+        new_lane = 0
+        for lbl in keep:
+            # Centerline = the cluster's mean track projected to GPS (the product
+            # that scores against annotations). Width and boundaries come from the
+            # perpendicular spread of the member vehicles about that centerline.
+            center_gps = np.asarray(trajectory_calibration(centers[lbl], self.rootpath, camera_loc)[0], float)
+            if center_gps.shape[0] < 2 or not np.isfinite(center_gps).all():
+                continue
+            lat0 = float(center_gps[:, 0].mean()); lon0 = float(center_gps[:, 1].mean())
+            m_lat = 111_320.0; m_lon = m_lat * np.cos(np.deg2rad(lat0))
+            cen_m = np.stack([(center_gps[:, 1] - lon0) * m_lon, (center_gps[:, 0] - lat0) * m_lat], axis=1)
+            axis = cen_m[-1] - cen_m[0]
+            axis = axis / (np.linalg.norm(axis) + 1e-9)
+            perp = np.array([-axis[1], axis[0]])
+            offs = []
+            for i, l in enumerate(labels):
+                if l != lbl:
+                    continue
+                g = np.asarray(trajectory_calibration(tracks[i], self.rootpath, camera_loc)[0], float)
+                pm = np.stack([(g[:, 1] - lon0) * m_lon, (g[:, 0] - lat0) * m_lat], axis=1)
+                offs.append(((pm - cen_m.mean(0)) @ perp))
+            spread = np.concatenate(offs) if offs else np.array([0.0])
+            width = float(np.clip(np.percentile(spread, 90) - np.percentile(spread, 10), 2.5, 4.5))
+            # perp is a unit vector in local meters [east, north]; convert a
+            # half-width offset back to a [lat, lon] delta for the boundaries.
+            off_gps = np.array([(width / 2.0) * perp[1] / m_lat, (width / 2.0) * perp[0] / m_lon])
+            bounds[new_lane] = {
+                'center': center_gps,
+                'left': center_gps + off_gps,
+                'right': center_gps - off_gps,
+                'width': width,
+            }
+            new_lane += 1
+        logger.info(f"{camera_loc}: clustering detector found {len(bounds)} lanes")
+        # tag traj_df for downstream consumers that expect clustered_id
+        remap = {lbl: i for i, lbl in enumerate(keep)}
+        lane_df = pl.DataFrame({'id': [vid for vid, l in zip(ids, labels) if l in remap],
+                                'clustered_id': [remap[int(l)] for l in labels if l in remap]})
+        traj_df = traj_df.join(lane_df, on='id', how='left').with_columns(
+            pl.col('clustered_id').fill_null(-1).cast(pl.Int64)) if lane_df.height else \
+            traj_df.with_columns(pl.lit(-1, dtype=pl.Int64).alias('clustered_id'))
+        return traj_df, {0: bounds}
 
     def run(self, c_epoch, g_epoch, traj_df,
             camera_loc, trial, is_save):
@@ -207,29 +398,70 @@ class GeometricLearning:
                 .agg([
                     pl.mean("x_gps").alias("x_mean"),
                     pl.mean("y_gps").alias("y_mean"),
-                    pl.mean("theta_rad").alias("theta_mean")
+                    pl.mean("theta_rad").alias("theta_mean"),
+                    pl.first("x_gps").alias("x_first"),
+                    pl.first("y_gps").alias("y_first"),
+                    pl.last("x_gps").alias("x_last"),
+                    pl.last("y_gps").alias("y_last"),
                 ])
             )
 
-            # Histogram
-            X = trajectory_summary["x_mean"].to_numpy().reshape(-1, 1)
+            # Lane separation coordinate: each vehicle's ACROSS-ROAD offset in
+            # meters (road axis from displacement directions, mean position
+            # projected on the perpendicular). The previous mean-x histogram
+            # mixed lateral offset with longitudinal position, so bin width
+            # scaled with road length in view and find_peaks' 3-bin minimum
+            # distance made 3.5 m lane spacing unresolvable at long-view sites
+            # for every theta. Falls back to mean-x when no axis is estimable.
+            lat_off, lat_valid = lateral_offsets(
+                trajectory_summary["x_mean"].to_numpy(),
+                trajectory_summary["y_mean"].to_numpy(),
+                trajectory_summary["x_first"].to_numpy(),
+                trajectory_summary["y_first"].to_numpy(),
+                trajectory_summary["x_last"].to_numpy(),
+                trajectory_summary["y_last"].to_numpy(),
+            )
+            if lat_off is not None:
+                trajectory_summary = trajectory_summary.with_columns(
+                    pl.Series("lat_off", lat_off)
+                ).filter(pl.Series(lat_valid))
+                X = trajectory_summary["lat_off"].to_numpy().reshape(-1, 1)
+            else:
+                logger.warning(f"{camera_loc} contour {cnts}: no road axis, using legacy mean-x")
+                X = trajectory_summary["x_mean"].to_numpy().reshape(-1, 1)
+                X = X[np.isfinite(X[:, 0])].reshape(-1, 1)
+                trajectory_summary = trajectory_summary.filter(
+                    pl.col("x_mean").is_finite()
+                )
 
-            hist_vals, bin_edges = np.histogram(X, bins=50)
-            # hist_vals, bin_edges = np.histogram(X, bins=50)
+            if len(X) < 3:
+                lane_num_list.append(0)
+                logger.info("Estimated number of lanes: 0 (too few valid vehicles)")
+                continue
+
+            hist_vals, bin_edges = np.histogram(X, bins=50, range=lateral_histogram_range(X[:, 0]))
             if 'sigma' in self.theta:
                 smoothed_hist = self.gaussian_filter(hist_vals, window_size=5, sigma=self.theta['sigma'].item() if isinstance(self.theta['sigma'], torch.Tensor) else self.theta['sigma'])
             else:
                 smoothed_hist = self.gaussian_filter(hist_vals, window_size=5, sigma=2)
 
-            # Adaptive peak detection based on theta
-            # if 'angle_penalty' in self.theta:
-            #     angle_val = self.theta['angle_penalty'].item() if isinstance(self.theta['angle_penalty'], torch.Tensor) else self.theta['angle_penalty']
-            #     # Adjust peak detection sensitivity based on angle penalty
-            #     prominence = 1 + angle_val  # Higher angle penalty = more strict peak detection
-            #     peaks, _ = find_peaks(smoothed_hist, height=1, distance=3, prominence=prominence)
-            # else:
-            #     peaks, _ = find_peaks(smoothed_hist, height=1, distance=3, prominence=1)
-            peaks, _ = find_peaks(smoothed_hist, height=1, distance=3, prominence=1)
+            # Adaptive peak detection: meta-learned peak salience (theta_prominence).
+            # RELATIVE peak salience: the histogram is normalized by its max
+            # smoothed peak, so peak_prominence is a scale-free fraction in
+            # (0, 1) with one meaning in every scene. On raw counts the right
+            # absolute threshold depends on traffic volume (sparse scenes have
+            # peaks of ~1 vehicle, busy scenes hundreds), which forced the
+            # meta-learner to infer scene scale from coarse features. Lower
+            # values recover weak lanes; higher values suppress spurious peaks.
+            prominence = self.theta.get('peak_prominence', torch.tensor(0.5))
+            if isinstance(prominence, torch.Tensor):
+                prominence = prominence.item()
+            hist_max = float(np.max(smoothed_hist))
+            norm_hist = smoothed_hist / hist_max if hist_max > 0 else smoothed_hist
+            # Use the same salience floor for height so that genuine peaks
+            # attenuated by Gaussian smoothing are not pre-filtered by the
+            # height gate before the prominence test is applied.
+            peaks, _ = find_peaks(norm_hist, height=prominence, distance=3, prominence=prominence)
             n_lanes = len(peaks)
 
             logger.info(f"Estimated number of lanes: {n_lanes}")
@@ -252,9 +484,33 @@ class GeometricLearning:
 
             if lane_num_list[c] != 0:
                 kmeans = KMeans(n_clusters=lane_num_list[c], random_state=0).fit(X)
+                labels = kmeans.labels_.astype(int)
+
+                # Absolute min-evidence gate (learned recall lever). Drop any
+                # cluster with fewer than min_lane_evidence supporting vehicles,
+                # then renumber the survivors contiguously so a low peak_prominence
+                # can recover weak lanes while spurious low-support peaks are
+                # rejected. The gate is in absolute counts (scene-dependent
+                # optimum), unlike the normalized peak_prominence. Default 1 = off.
+                min_ev = self.theta.get('min_lane_evidence', 1)
+                if isinstance(min_ev, torch.Tensor):
+                    min_ev = min_ev.item()
+                min_ev = max(1, int(round(float(min_ev))))
+                counts = np.bincount(labels, minlength=lane_num_list[c])
+                keep = [lbl for lbl in range(len(counts)) if counts[lbl] >= min_ev]
+                if not keep:
+                    lane_num_list[c] = 0
+                    logger.info(f"contour {cnts}: all {len(counts)} clusters below "
+                                f"min_lane_evidence={min_ev}, 0 lanes")
+                    continue
+                if len(keep) < len(counts):
+                    remap = {old: new for new, old in enumerate(keep)}
+                    labels = np.array([remap.get(l, -1) for l in labels])
+                    lane_num_list[c] = len(keep)
+
                 trajectory_summary = trajectory_summary.with_columns([
-                    pl.lit(kmeans.labels_).cast(pl.Int64).alias("clustered_id")
-                ])
+                    pl.lit(labels).cast(pl.Int64).alias("clustered_id")
+                ]).filter(pl.col("clustered_id") >= 0)
                 cluster_assignments.append(trajectory_summary.select(["id", "clustered_id"]))
 
                 df_labeled = df_contour.join(
@@ -281,6 +537,15 @@ class GeometricLearning:
                         ax3.plot(data["center"][:, 1], data["center"][:, 0], color=self.colors[int(lane_id)], linewidth=2.5, label=f"Lane Centerline {lane_id}")
                         ax3.plot(data["left"][:, 1], data["left"][:, 0], color=self.colors[int(lane_id)], linewidth=1.0)
                         ax3.plot(data["right"][:, 1], data["right"][:, 0], color=self.colors[int(lane_id)], linewidth=1.0)
+
+        if not cluster_assignments:
+            # No contour produced any lane cluster (e.g. an aggressive theta such as a
+            # high peak_prominence suppressing every histogram peak). Return the designed
+            # "no lanes detected" outcome so the trial search scores this theta as bad
+            # instead of crashing the whole client round.
+            logger.warning(f"{camera_loc}: no lane clusters found for any contour (theta={self.theta})")
+            traj_df = traj_df.with_columns(pl.lit(-1, dtype=pl.Int64).alias("clustered_id"))
+            return traj_df, lane_boundaries_for_contour
 
         all_assignments = pl.concat(cluster_assignments)
 
@@ -388,27 +653,101 @@ class GeometricLearning:
         
         triplet_loss_fn = LaneTripletLoss(margin=triplet_margin)
 
-        # Adjust sumo lane number for detected results.
+        # SUMO polylines can lose points to the graph dedup in create_sumo_graph
+        # (coordinates shared across lanes in a group are dropped), so resample any
+        # lane that doesn't match the detected 30-point resolution before stacking.
+        target_points = detected_center_list.shape[1] if detected_center_list.dim() == 3 else 30
+        # Drop degenerate references: fewer than 2 points OR zero arc length
+        # (a lane whose 30 points are all the same coordinate cannot be
+        # parameterized and would crash every spline consumer downstream).
+        sumo_center_list = [
+            s for s in sumo_center_list
+            if s.shape[0] >= 2 and float(torch.diff(s, dim=0).abs().sum()) > 0
+        ]
+        sumo_center_list = [
+            s if s.shape[0] == target_points else torch.tensor(
+                np.asarray(interpolate_edge(s.numpy(), num_points=target_points)), dtype=torch.float32)
+            for s in sumo_center_list
+        ]
+
+        # No evidence-backed reference lanes (possible at very low data volume:
+        # target-lane selection requires 30 nearby points per lane). The epoch is
+        # unevaluable rather than good or bad: finite loss to keep the trial
+        # search alive, NaN metrics so it drops out of averages.
+        if not sumo_center_list:
+            logger.warning("No reference lanes after evidence filtering; epoch unevaluable")
+            nan = float('nan')
+            return (torch.tensor(10.0 * max(lane_num, 1)), lane_num, torch.tensor(0.0),
+                    torch.tensor(0.0), torch.tensor(0.0),
+                    {'geo_consistency_m': nan, 'geo_coverage_m': nan, 'geo_centerline_m': nan,
+                     'geo_width_m': nan, 'geo_total_m': nan, 'lane_count_err': nan,
+                     'lane_count_exact': nan, 'error': 'no reference lanes'})
+
+        # Associate detected lanes with reference lanes by mean nearest-point
+        # distance in meters, ONE-TO-ONE (Hungarian assignment). Greedy nearest
+        # matching let two detected lanes claim the same reference at multi-lane
+        # sites (3/8 lanes at Mineral), inflating the geometry terms while real
+        # references sat unmatched. Polyline parameterization direction must not
+        # affect the cost (SUMO shapes often run opposite to travel direction),
+        # so no index-aligned comparison. Detected lanes beyond the reference
+        # count fall back to their nearest reference (shared).
+        cost = torch.zeros((lane_num, len(sumo_center_list)))
+        for i, detected in enumerate(detected_center_list):
+            for j, sumo in enumerate(sumo_center_list):
+                cost[i, j] = gps_pairwise_distance(detected, sumo).min(dim=1).values.mean()
+
+        row_ind, col_ind = linear_sum_assignment(cost.numpy())
+        assignment = dict(zip(row_ind.tolist(), col_ind.tolist()))
+
         matched_sumo_lanes = []
-
-        for detected in detected_center_list:
-            min_dist = float('inf')
-            closest = None
-
-            for sumo in sumo_center_list:
-                # dist = torch.cdist(detected, sumo, p=2).mean()
-                try:
-                    dist = torch.sqrt(torch.sum((detected[15] - sumo[15])**2))
-                except:
-                    dist = torch.sqrt(torch.sum((torch.mean(detected) - torch.mean(sumo))**2))
-
-                if dist < min_dist:
-                    min_dist = dist
-                    closest = sumo
-
-            matched_sumo_lanes.append(closest.unsqueeze(0)) # shape (1, 30, 2)
+        matched_idx = []
+        for i in range(lane_num):
+            j = assignment.get(i, int(cost[i].argmin()))
+            matched_sumo_lanes.append(sumo_center_list[j].unsqueeze(0))
+            matched_idx.append(j)
 
         sumo_lanes = torch.cat(matched_sumo_lanes, dim=0) # shape (4, 30, 2)
+
+        # Orient each matched reference to the detected lane's direction, then clip
+        # it to the detected segment's extent, before the order-sensitive
+        # comparisons below (Frechet walks both curves in sequence, the triplet
+        # compares points index-aligned). SUMO lane shapes often run opposite to
+        # the detected travel direction, and a reference lane extends far beyond
+        # the camera view — without orientation the consistency term measures lane
+        # length, and without clipping it charges the unobservable extent even
+        # when the shapes agree over the common footprint.
+        def _align_reference(P, Q, dense=240):
+            ends = gps_pairwise_distance(P[[0, -1]], Q[[0, -1]])
+            if ends[0, 1] + ends[1, 0] < ends[0, 0] + ends[1, 1]:
+                Q = torch.flip(Q, dims=[0])
+            # Densify before slicing: the slice endpoints land on reference
+            # vertices, and with 30 points a long lane has many meters between
+            # vertices — discrete Frechet is a max metric, so that overhang alone
+            # would set the consistency floor. Clipping is an accuracy refinement,
+            # so on any numerical failure fall back to the oriented full lane.
+            try:
+                Qd = torch.tensor(np.asarray(interpolate_edge(Q.numpy(), num_points=dense)),
+                                  dtype=torch.float32, device=Q.device)
+                i0 = int(gps_pairwise_distance(P[0:1], Qd).argmin())
+                i1 = int(gps_pairwise_distance(P[-1:], Qd).argmin())
+                lo, hi = min(i0, i1), max(i0, i1)
+                if hi - lo >= 2:
+                    seg = Qd[lo:hi + 1]
+                    if i0 > i1:
+                        seg = torch.flip(seg, dims=[0])
+                    clipped = torch.tensor(
+                        np.asarray(interpolate_edge(seg.numpy(), num_points=Q.shape[0])),
+                        dtype=torch.float32, device=Q.device)
+                    if clipped.shape == Q.shape and bool(torch.all(torch.isfinite(clipped))):
+                        Q = clipped
+            except Exception as e:
+                logger.warning(f"Reference clipping failed, using full lane: {e}")
+            return Q
+
+        oriented = []
+        for lane in range(lane_num):
+            oriented.append(_align_reference(detected_center_list[lane], sumo_lanes[lane]).unsqueeze(0))
+        sumo_lanes = torch.cat(oriented, dim=0)
 
 
         for lane in range(lane_num):
@@ -438,14 +777,21 @@ class GeometricLearning:
                 frechet_dist = frechet_distance(detected_center_list[lane], sumo_lanes[lane])
                 l_cons_list.append(frechet_dist)
 
-            # print(f"SUMO length: {len(sumo_lanes)}, Detected length: {len(detected_center_list)}")
+            # Eq. 7 contrastive term: anchor = detected lane, positive = its matched
+            # reference, negative = the nearest reference lane that is NOT the
+            # positive (hard negative). With a single reference lane in view there is
+            # no valid negative and the term is skipped for that lane.
             anchor = detected_center_list[lane].to(device)
             positive = sumo_lanes[lane].to(device)
-            for j in range(lane_num):
-                if lane == j:
-                    negative = detected_center_list[j].to(device)
-                    l_trip += triplet_loss_fn(anchor.unsqueeze(0), positive.unsqueeze(0), negative.unsqueeze(0))
-                    num_triplets += 1
+            neg_candidates = [s for j, s in enumerate(sumo_center_list) if j != matched_idx[lane]]
+            if neg_candidates:
+                neg_dists = torch.stack([
+                    gps_pairwise_distance(anchor, s.to(device)).min(dim=1).values.mean()
+                    for s in neg_candidates
+                ])
+                negative = _align_reference(anchor, neg_candidates[int(neg_dists.argmin())].to(device))
+                l_trip += triplet_loss_fn(anchor.unsqueeze(0), positive.unsqueeze(0), negative.unsqueeze(0))
+                num_triplets += 1
 
         # Combine consistency losses
         if l_cons_list:
@@ -460,6 +806,7 @@ class GeometricLearning:
         l_trip = l_trip / max(1, num_triplets)
 
         # Geometry loss: width + length comparison
+        raw_width_m = float('nan')
         if sumo_lane_shape is not None and cluster_to_edge_map is not None:
             detected_length_list = []
             # detected_length = torch.zeros(lane_num, device=device, requires_grad=True)
@@ -494,8 +841,15 @@ class GeometricLearning:
                 dw.to(device) if isinstance(dw, torch.Tensor) else torch.tensor(dw, dtype=torch.float32, device=device)
                 for dw in detected_width
             ]
-            sumo_width = torch.full((len(detected_width),len(detected_width[0])), 3.2)
             detected_width = torch.stack(detected_width) if detected_width else torch.zeros(lane_num, device=device)
+
+            # Per-lane reference widths from the SUMO net (Eq. 6's map-derived c_mw).
+            # Unmatched lanes (sumo_width_list left at 0.0) fall back to the 3.2 m default.
+            ref_widths = torch.stack([
+                w if float(w) > 0 else torch.tensor(3.2, device=device)
+                for w in sumo_width_list
+            ])
+            sumo_width = ref_widths.unsqueeze(1).expand(lane_num, detected_width.shape[1])
 
             width_errors = torch.stack([
                 torch.mean((sumo_width[i] - detected_width[i]) ** 2)
@@ -506,6 +860,15 @@ class GeometricLearning:
             # Not sure if we need to use length_term here as SUMO length is articulated by finding the closest lanes
             # l_geo = (width_term + length_term) / lane_num
             l_geo = width_term
+
+            # Raw, unweighted mean absolute width error in meters against the real
+            # per-lane SUMO reference. The learnable width_scale is divided back out
+            # so the metric measures the trajectory-derived width estimate itself and
+            # stays comparable across models with different learned scales.
+            ws = self.theta.get('width_scale', 1.0)
+            ws = float(ws.item()) if isinstance(ws, torch.Tensor) else float(ws)
+            unscaled_width = detected_width / ws if ws > 0 else detected_width
+            raw_width_m = float(torch.mean(torch.abs(unscaled_width - sumo_width)).item())
 
 
         weight_lane = self.theta.get('weight_lane_count', torch.tensor(1.0))
@@ -527,4 +890,54 @@ class GeometricLearning:
         l_total = (weight_lane * l_lane_count * 10 + weight_cons * l_cons + \
                     weight_trip * l_trip + weight_geo * l_geo)
 
-        return l_total, l_lane_count, l_cons, l_trip, l_geo
+        # ---- Model-independent geometric metrics (meters), free of learned weights ----
+        # Reported for fair cross-model comparison (Table 1). Unlike l_cons (scaled by
+        # the learned consistency_weight), l_trip (a margin-offset triplet) and l_total
+        # (baseline weights sum to 4 vs. meta's softmax weights sum to 1), these raw
+        # quantities are computed identically for every model.
+        if l_cons_list:
+            raw_consistency_m = float(torch.stack(l_cons_list).mean().item())
+        else:
+            raw_consistency_m = float('nan')
+
+        dev_list = []
+        for lane in range(lane_num):
+            P = detected_center_list[lane]
+            Q = sumo_lanes[lane]
+            if P.shape[0] > 0 and Q.shape[0] > 0:
+                D = gps_pairwise_distance(P, Q)  # (m, n) in meters
+                dev_list.append(D.min(dim=1).values.mean())
+        raw_centerline_m = float(torch.stack(dev_list).mean().item()) if dev_list else float('nan')
+
+        # Recall direction: how far is each reference SUMO lane from its nearest
+        # DETECTED lane. Centerline/consistency above only score the lanes a model
+        # chose to detect, so a model that skips hard lanes is never charged for
+        # them; coverage is where a missed lane shows up.
+        cov_list = []
+        for Q in sumo_center_list:
+            if Q.shape[0] == 0:
+                continue
+            per_detected = []
+            for lane in range(lane_num):
+                P = detected_center_list[lane]
+                if P.shape[0] > 0:
+                    D = gps_pairwise_distance(Q, P)  # (points_Q, points_P) in meters
+                    per_detected.append(D.min(dim=1).values.mean())
+            if per_detected:
+                cov_list.append(torch.stack(per_detected).min())
+        raw_coverage_m = float(torch.stack(cov_list).mean().item()) if cov_list else float('nan')
+
+        comps = [raw_consistency_m, raw_centerline_m, raw_width_m, raw_coverage_m]
+        geo_total_m = float(np.nansum(comps)) if any(not np.isnan(c) for c in comps) else float('nan')
+
+        raw_metrics = {
+            'geo_consistency_m': raw_consistency_m,  # mean Frechet distance to reference centerline
+            'geo_coverage_m': raw_coverage_m,        # mean reference-lane distance to nearest detected lane (recall)
+            'geo_centerline_m': raw_centerline_m,    # mean nearest-point centerline deviation
+            'geo_width_m': raw_width_m,              # mean |detected - reference| lane width
+            'geo_total_m': geo_total_m,              # equal-weight sum of the three (all meters)
+            'lane_count_err': float(l_lane_count),   # |N_det - N_ref|
+            'lane_count_exact': 1.0 if l_lane_count == 0 else 0.0,  # exact match -> accuracy %
+        }
+
+        return l_total, l_lane_count, l_cons, l_trip, l_geo, raw_metrics

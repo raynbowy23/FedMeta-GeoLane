@@ -31,22 +31,37 @@ parser.add_argument('--T', type=int, default=60, help='Time interval of each cyc
 parser.add_argument('--is_save', action='store_true', help='Save the results or not')
 parser.add_argument('--conf_thre', type=float, default='0.25', help='Detection confidence score threshold when creating '
                                                                     'the road segment')
-parser.add_argument('--osm_path', type=str, default="./LaneDetection/osm_extraction/", help='The path of the OSM file to extract data from')
-parser.add_argument('--model', type=str, default='federated', help='Model type: federated, baseline, meta')
+parser.add_argument('--osm_path', type=str, default="./dataset/sumo/", help='Directory holding per-camera SUMO/OSM exports (<camera>/osm.net.xml)')
+parser.add_argument('--model', type=str, default='federated', choices=['federated', 'baseline', 'meta'], help='Model type: federated, baseline, meta')
 parser.add_argument('--use_historical_data', action='store_true', help='Use historical data or not')
 parser.add_argument('--skip_continuous_learning', action='store_true', help='Skip continuous learning or not')
 parser.add_argument('--lambda_thres', type=int, default='120', help='Criteria of stopping the cycle learning')
 parser.add_argument('--cnts_threshold', type=int, default='0', help='Contours threshold')
 parser.add_argument('--centralized', action='store_true', help='Centralized learning or not')
+parser.add_argument('--data_fraction', type=float, default=1.0, help='Fraction of trajectory ids kept per camera (data-scarcity experiments)')
 
 # Federated learning specific arguments
 parser.add_argument('--federated', action='store_true', help='Use federated meta-learning')
 parser.add_argument('--fed_rounds', type=int, default=100, help='Number of federated learning rounds')
 parser.add_argument('--client_selection_ratio', type=float, default=0.8, help='Ratio of clients to select per round')
 parser.add_argument('--meta_lr', type=float, default=1e-3, help='Learning rate for meta-model')
+parser.add_argument('--fed_algo', type=str, default='perfedavg', choices=['perfedavg', 'fedavg', 'central'],
+                    help='Federated aggregation: perfedavg (meta-init, default), fedavg (mean-regressor ablation), or central (pooled supervised, centralized upper bound). Only affects --model federated.')
+parser.add_argument('--seen_deploy', type=str, default='buffer', choices=['buffer', 'model'],
+                    help='Seen-site deployment for --model federated: buffer (best theta from training history, model bypassed) or model (deploy the trained model prediction + calibration). Test whether a recovered model reaches the seen table.')
+parser.add_argument('--seen_clients', type=str, default=None,
+                    help='Comma-separated override of the SEEN training cameras (fleet-scaling experiments). Unseen split unchanged. Example: --seen_clients US12_Monona,US12_Yahara')
 
 args = parser.parse_args()
 print(args)
+
+if args.seen_clients:
+    # Fleet-scaling override: restrict the SEEN training set. All in-module
+    # references read the module global at call time, so reassigning here is
+    # sufficient; the unseen evaluation split is untouched.
+    import geolearning_system as _gls
+    _gls.SEEN_CLIENTS = [c.strip() for c in args.seen_clients.split(',') if c.strip()]
+    print(f"SEEN_CLIENTS override: {_gls.SEEN_CLIENTS}")
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(filename=f'logs/{args.model}_test.log', filemode='w', encoding='utf-8', level=logging.INFO)
@@ -92,8 +107,8 @@ with open(Path(args.dataset_path, "camera_location_list.txt"), 'r') as f:
 
 barrier = threading.Barrier(2) # 2 threads need to sync
 
-# Set random seeds for reproducibility
-seed = 42
+# Set random seeds for reproducibility (--seed, default 42)
+seed = args.seed
 random.seed(seed)
 np.random.seed(seed)
 torch.manual_seed(seed)
@@ -107,6 +122,7 @@ def main():
     with mlflow.start_run():
         mlflow.log_param("strategy", args.model)
         mlflow.log_param("seed", args.seed)
+        mlflow.log_param("data_fraction", args.data_fraction)
         mlflow.log_param("device", device)
         mlflow.log_param("num_cameras", len(camera_loc_list))
 

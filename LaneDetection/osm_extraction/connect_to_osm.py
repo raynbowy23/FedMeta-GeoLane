@@ -80,8 +80,9 @@ class OSMConnection:
                 shape = lane.get('shape')
                 # length = lane.get('length')
                 length = self.compute_polyline_length(shape, camera_loc)
-                # TODO: Update the width of the lane by lane type, default is 3.2m
-                lane_shape[lane_id] = (length, 3.2)
+                # Real per-lane width from the net when present; SUMO's default is 3.2 m
+                # for driving lanes, so absent attributes fall back to that.
+                lane_shape[lane_id] = (length, float(lane.get('width', 3.2)))
                 # Convert shape to list of coordinates
                 points = [tuple(map(np.float64, p.split(','))) for p in shape.split()]
                 lane_edge_geometries[lane_id] = points
@@ -335,13 +336,16 @@ class OSMConnection:
 
                 min_points_threshold = 30
 
-                if len(lane_counts) > 0:
-                    target_lanes = {
-                        lane if count >= min_points_threshold else np.str_(-1)
-                        for lane, count in lane_counts.items()
-                    }
-                else:
-                    target_lanes = np.str_(-1)
+                # Keep only lanes with enough nearby trajectory evidence. Lanes
+                # under the threshold are DROPPED (the old code replaced each with
+                # a '-1' string that leaked into the set), and junction-internal
+                # lanes (':'-prefixed connector stubs) are excluded because they
+                # are not comparable lane references and inflate both the lane
+                # count and the matching pool.
+                target_lanes = {
+                    lane for lane, count in lane_counts.items()
+                    if count >= min_points_threshold and not str(lane).startswith(':')
+                }
 
                 # Ensure lane_group exists in the dictionary
                 if lane_group not in lane_group_dict:
@@ -352,9 +356,11 @@ class OSMConnection:
                 gps_traj_points = gps_traj_points[valid_points]
 
                 # Store lane points in a structured dictionary
+                # A group with no evidence-backed lanes stays empty. The old code
+                # inserted a fake all-zeros lane here, which counted as a
+                # reference lane and produced degenerate zero-length polylines
+                # downstream.
                 for lane_id, points in gps_lane_geometries.items():
-                    if target_lanes == "-1":
-                        lane_group_dict[lane_group] = {-1: np.zeros((10, 2))}
                     if lane_id in target_lanes: # Only keep lanes with enough nearby trajectory points
 
                         # We want to regulate points to only proximity, otherwise SUMO covers larger area so we cannot compare fairly
@@ -405,9 +411,8 @@ class OSMConnection:
                             s=5, alpha=0.7, color=color,
                             label=f'Lane {lane_id}'
                         )
-                    except:
-                        print("Got some error")
-                        print(color)
+                    except Exception as e:
+                        logger.debug(f"Skipping trajectory scatter for lane {lane_id}: {e}")
             
                 # Print the selected target lanes
                 logger.info(f"Target lanes selected based on trajectory density for lane group {lane_group}: {target_lanes}")

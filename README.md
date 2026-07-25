@@ -13,7 +13,7 @@ At the core of Geo-ORBIT is **FedMeta-GeoLane**, a federated meta-learning-based
 
 <figure style="text-align: center;">
   <img src="figs/qualitative_result.png" width="100%">
-  <figcaption><b>Figure:</b> Qualitative comparison across multiple locations. The camera at Park is treated as an unseen location for Meta-GeoLane and FedMeta-GeoLane. Blue lines represent trajectory contours, and each lane is colored accordingly in the same lane group.</figcaption>
+  <figcaption><b>Figure:</b> Qualitative comparison across four sites, with Keefe held out. Rows show the two external baselines (Qiu et al. and Ren), then the fixed baseline, the per-camera meta model, and the federated meta model; columns show Yahara, Mineral, CountyAB, and Keefe. Detected lanes are grouped by lane group and coloured left to right within each group, drawn over the human annotations in faint black.</figcaption>
 </figure>
   <!-- <figcaption><b>Figure:</b> Architecture of the federated meta-learning framework. The framework detects roadway geometry at local entities with local GeoLane models. The central server collects parameters from local entities with federated learning. The DT synchronizes road geometry and trajectories in a simulated environment.</figcaption> -->
 
@@ -41,17 +41,10 @@ git clone https://github.com/raynbowy23/FedMeta-GeoLane.git
 cd FedMeta-GeoLane
 ```
 
-Create uv environment with Python >= 3.10. 
+Create the environment and install dependencies with uv (canonical for this repo; the pins live in `pyproject.toml`).
 ```bash
-uv init
 uv sync
-# Linux
-source .venv/bin/activate
-```
-
-Install dependencies
-```bash
-pip install -r requirements.txt
+source .venv/bin/activate   # Linux/macOS
 ```
 
 Set up SUMO
@@ -114,7 +107,7 @@ python main.py --model meta --T 60 --is_save --skip_continuous_learning --use_hi
 
 **Baseline (Fixed Parameters)**
 ```bash
-python main.py --model federated --T 60 --is_save --skip_continuous_learning --use_historical_data
+python main.py --model baseline --T 60 --is_save --skip_continuous_learning --use_historical_data
 ```
 
 ### Key Parameters
@@ -128,15 +121,14 @@ python main.py --model federated --T 60 --is_save --skip_continuous_learning --u
 ### Output Structure
 ```bash
 results/
-└── 511video/
-    └── model_name/
-        ├── camera_location/
-        |   ├── figures/                            # Visualizations
-        |   ├── preprocess/                         # Processed data
-        |   ├── sumo/                               # SUMO network files
-        |   ├── pixel/                              # Mid opeartion visualization
-        |   └── federated_trajectory_clustering.csv # Only for federated learning
-        └── training_results/                       # Final results
+├── preprocess/                                 # Canonical per-camera tracking output (checked in)
+│   └── <camera>/                               # collect_cars.npy, last_frame.npy, trajectory.csv, ...
+└── <model>/                                    # baseline | meta | federated
+    ├── <camera>/
+    │   ├── figures/                            # Visualizations
+    │   ├── pixel/                              # Mid-operation visualization
+    │   └── federated_trajectory_clustering.csv # Federated learning only
+    └── training_results/                       # Final results
 ```
 
 ## Simulation Integration
@@ -191,44 +183,44 @@ FedMeta-GeoLane treats each roadside camera deployment as a unique task. A share
 </figure>
 
 
-_Compared to baseline and centralized models, FedMeta-GeoLane reduces geometric error by over 50% in unseen locations while achieving a 98% reduction in communication cost._
+_Validated against independent human annotations, FedMeta-GeoLane detects lane geometry within about 3 m, roughly an order of magnitude closer than the public map that supervises it, and transfers a single global model to unseen sites while reducing per-camera communication by more than 99%._
 
 
 ## Performance Summary
 
 ### Lane Detection Accuracy
-**Table: Validation Loss Component Comparisons of Each Model on Seen and Unseen Locations**
-| **Model**            | **Consistency Loss (m) &#8595;** | **Geometry Loss (m) &#8595;** | **Centerline Error (m) &#8595;** | **Lane Count Error &#8595;** |**Total Loss &#8595;** |
-|------------------|---------------------|-------------------------|--------------------|-----------------------|-----------------------|
-| _Seen_             |                   |                    |                       |                  |                     |
-| Baseline         | 5.45              | 15.12              | 6.78                  | 5.00             | 77.84               |
-| Meta-GeoLane     | 7.04              | 11.76             | 4.73                 | **2.67**            | 12.16               |
-| **FedMeta-GeoLane** | 0.0            | **2.65**         | **3.16**             | **2.67**            | **6.94**           |
-| _Unseen_             |                   |                    |                       |                  |                   |
-| Meta-GeoLane     | 18.51             | 105.35             | 34.60                 | 12.00            | 69.61               |
-| **FedMeta-GeoLane** | 0.0            | **12.82**         | **21.39**             | 12.00            | **32.38**           |
+
+Detection is scored against independent human lane annotations with one-to-one Hungarian matching at a 5 m threshold. Numbers below are means over three training seeds (the fixed baseline is deterministic). See the paper for the full geometry decomposition and calibration tables.
+
+**Table: Lane-level detection against human annotations (precision / recall / F1)**
+| **Method** | **Seen P** | **Seen R** | **Seen F1** | **Unseen P** | **Unseen R** | **Unseen F1** |
+|---|---|---|---|---|---|---|
+| OSM reference | 0.65 | 0.60 | 0.63 | 0.28 | 0.34 | 0.31 |
+| Qiu et al. | 0.63 | 0.44 | 0.52 | 0.38 | 0.16 | 0.22 |
+| Ren | 0.70 | 0.74 | 0.72 | 0.68 | 0.68 | 0.68 |
+| GeoLane (baseline) | 0.83 | 0.60 | 0.698 | 0.81 | 0.55 | 0.656 |
+| Meta-GeoLane | 0.89 | 0.67 | **0.760** | 0.90 | 0.49 | 0.636 |
+| **FedMeta-GeoLane** | 0.88 | 0.67 | 0.757 | 0.91 | 0.53 | **0.666** |
 
 <figure style="text-align: center;">
   <img src="figs/qualitative_result.png" width="100%">
-  <figcaption><b>Figure:</b> Qualitative comparison across multiple locations. The camera at Park is treated as an unseen location for Meta-GeoLane and FedMeta-GeoLane. Blue lines represent trajectory contours, and each lane is colored accordingly in the same lane group.</figcaption>
+  <figcaption><b>Figure:</b> Qualitative comparison across four sites, with Keefe held out. Rows show the two external baselines (Qiu et al. and Ren), then the fixed baseline, the per-camera meta model, and the federated meta model; columns show Yahara, Mineral, CountyAB, and Keefe. Detected lanes are grouped by lane group and coloured left to right within each group, drawn over the human annotations in faint black.</figcaption>
 </figure>
 
 
 
 ### Transmission Cost Analysis
 
-**Table: Bit Per Second Performance Comparison for All Clients**
+**Table: Communication payload per federated round**
 
-| Parameters         | Baseline | Meta | Federated Meta |
-|--------------------|----------|------|----------------|
-| Model size (MB)    | 0        | 0    | 0.2            |
-| Clients            | 4        | 4    | 4              |
-| Rounds             | 1        | 20   | 20             |
-| Model Upload (MB)  | 0        | 0    | 0.01           |
-| File Upload (MB)   | 427.3    | 427.3| 5.6            |
-| Download (MB)      | 0        | 0    | 0.018          |
-| BPS (Mbps)         | 3418     | 3418 | **47.2**       |
- 
+| Approach | Per camera | Fleet |
+|---|---|---|
+| Centralized (raw trajectories) | 0.35–4.3 MB | 12.9 MB |
+| FedMeta (parameters only) | **0.9 KB** | **5.4 KB** |
+| Reduction | **>99%** | **>99%** |
+
+The federated meta-learner exchanges only the low-dimensional parameter vector (632 B upload, 262 B download per camera per round), so no raw trajectory or image content leaves the camera.
+
 
 ## Digital Twin Integration
 

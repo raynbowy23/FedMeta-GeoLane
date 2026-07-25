@@ -11,12 +11,45 @@ from pathlib import Path
 
 from utils import compute_loss_for_baseline
 
-from LaneDetection.lane_detection.utils import SceneFeatureExtractor
+from LaneDetection.lane_detection.utils import (SceneFeatureExtractor, perturb_theta, no_detection_result,
+                                                trial_score, SCENE_FEATURE_DIM, DEPLOYMENT_CALIBRATION_TRIALS)
 from LaneDetection.lane_detection.meta_federated_lane_detection import (
     MetaMLModel, FederatedMetaLearner
 )
 
 logger = logging.getLogger(__name__)
+
+
+# Single train/test camera split, shared by all strategies (baseline/meta/federated)
+# so Table 1 compares them on the SAME seen/unseen cameras. To change the split,
+# edit only these two lists. A camera is used only if it also has preprocessed data
+# that round (select_clients intersects with available_clients), so listing one that
+# isn't set up yet is safely skipped and logged.
+# US12_Whitney removed 2026-07-05: hard location with a model-independent failure
+# signature (all strategies score ~45 m consistency there, suggesting site-level
+# calibration or reference-geometry error, not detection differences). Like
+# JohnNolen it was added during the revision and is not in the reviewed set.
+SEEN_CLIENTS = [
+    'US12_Todd', 'US12_Monona', 'US12_Yahara',
+    'US12_Mineral', 'US12_University', 'US12_CountyAB',
+]
+# UNIFORM SITE-EXCLUSION RULE (2026-07-10): a site is excluded from the split when
+# its annotation-based detection error under the FIXED baseline theta exceeds 5 m
+# (reference_audit.py; model-independent, so the rule cannot favor any method).
+# Applied to all candidate sites it excludes exactly US12_Stoughton (6.83 m,
+# near-horizon GCPs) and US12_Whitney (7.06 m) — every retained site is
+# 0.20-4.32 m (post-lateral audit, 2026-07-10).
+# CountyAB is retained because its large error is on the OSM REFERENCE side, not
+# detection. Excluded sites remain as the R1.3 calibration case studies; re-picking
+# their GCPs (bringing them under 5 m) readmits them. JohnNolen removed separately
+# (not in the reviewed submission's camera set).
+# US12_JohnNolen removed 2026-07-05: one of the hardest locations (dense multi-lane
+# arterial; its both-directions reference net also inflates lane counts) and not part
+# of the reviewed submission's camera set. Park stays — it is in the reviewed set.
+# 2026-07-07: unseen set expanded to 4 sites (all fully provisioned: net +
+# calibration + preprocess). The I43 cameras are a different corridor from every
+# training site, testing generalization beyond the US12 scene family.
+UNSEEN_CLIENTS = ['US12_Park', 'US12_Greenway', 'I43_Keefe', 'I43_Walnut']
 
 
 class GeoLearningSystem:
@@ -35,6 +68,9 @@ class GeoLearningSystem:
         
         # Shared components for all strategies
         self.client_data_buffer = defaultdict(list)
+        # Cached test-time calibrated thetas for sites with no local training
+        # history, filled on first deployment contact.
+        self.deployment_theta = {}
         self.training_history = []
         
     def _initialize_strategy_components(self):
@@ -57,6 +93,13 @@ class GeoLearningSystem:
             'triplet_margin': torch.tensor(0.8),
             'smoothing_factor': torch.tensor(10.0),
             'edge_trim_ratio': torch.tensor(0.1),
+            # Fixed RELATIVE salience threshold: half of the scene's strongest
+            # smoothed peak, the neutral analogue of the old absolute 1.0 under
+            # the normalized histogram.
+            'peak_prominence': torch.tensor(0.5),
+            # Recall lever pinned off for the fixed baseline (the learned
+            # strategies adapt it); 1 = no cluster is gated, i.e. current behavior.
+            'min_lane_evidence': torch.tensor(1.0),
             'weight_lane_count': torch.tensor(1.0),
             'weight_consistency': torch.tensor(1.0),
             'weight_triplet': torch.tensor(1.0),
@@ -73,12 +116,16 @@ class GeoLearningSystem:
     def _init_federated(self):
         """Initialize federated meta-learning strategy"""
         self.meta_model = MetaMLModel(
-            feature_dim=5,
+            feature_dim=SCENE_FEATURE_DIM,
             hidden_dim=128,
             num_theta_params=5
         ).to(self.device)
         
-        self.fed_learner = FederatedMetaLearner(self.meta_model, self.device)
+        self.fed_learner = FederatedMetaLearner(
+            self.meta_model, self.device,
+            fed_algo=getattr(self.args, 'fed_algo', 'perfedavg'),
+            seen_deploy=getattr(self.args, 'seen_deploy', 'buffer'),
+        )
         self.client_selection_ratio = 0.8
         
         logger.info("Initialized federated strategy")
@@ -94,7 +141,7 @@ class GeoLearningSystem:
         """Setup individual meta-models for meta-learning strategy"""
         for camera_loc in self.camera_loc_list:
             self.meta_models[camera_loc] = MetaMLModel(
-                feature_dim=5, hidden_dim=128, num_theta_params=5
+                feature_dim=SCENE_FEATURE_DIM, hidden_dim=128, num_theta_params=5
             ).to(self.device)
             self.optimizers[camera_loc] = torch.optim.Adam(
                 self.meta_models[camera_loc].parameters(), lr=1e-3
@@ -137,35 +184,116 @@ class GeoLearningSystem:
         
         return loss, self.fixed_theta, metrics
     
+    def _nearest_trained_client(self, scene_features):
+        """Seen client whose buffered scene features are closest (L2) to the given scene."""
+        target = scene_features.squeeze().detach().cpu()
+        best_id, best_d = None, float('inf')
+        for cid in SEEN_CLIENTS:
+            buf = self.client_data_buffer.get(cid, [])
+            if not buf:
+                continue
+            feats = torch.stack([b['scene_features'].squeeze() for b in buf]).mean(dim=0)
+            d = float(torch.norm(feats - target))
+            if d < best_d:
+                best_d, best_id = d, cid
+        return best_id
+
     def _meta_client_update(self, client_id, processed_data, geo_learning):
-        """Meta-learning client update with individual models"""
+        """Meta-learning client update with individual models.
+
+        In training mode this runs the same black-box trial search as the federated
+        strategy (prediction + 2 perturbed trials, keep the best theta by task loss)
+        so the buffered best_theta is a real supervision target. Regressing the model
+        onto its own prediction would make the MSE identically zero and train nothing.
+        """
         start_time = time.time()
 
         # Extract scene features and predict theta
         scene_features = SceneFeatureExtractor.extract_features(processed_data).to(self.device)
-        
-        self.meta_models[client_id].eval()
+
+        # Unseen cameras have no locally trained model. Deploy the trained seen
+        # model whose buffered scene statistics are closest to this scene
+        # (nearest-scene parameter transfer), so the meta ablation measures
+        # meta-learning without federation rather than an untrained network.
+        model = self.meta_models[client_id]
+        if not self.training_mode and not self.client_data_buffer[client_id]:
+            donor_id = self._nearest_trained_client(scene_features)
+            if donor_id is not None:
+                model = self.meta_models[donor_id]
+                logger.info(f"[Meta deploy] {client_id}: nearest-scene transfer from {donor_id}")
+
+        model.eval()
         with torch.no_grad():
-            predicted_theta = self.meta_models[client_id](scene_features)
+            predicted_theta = model(scene_features)
             predicted_theta_values = {
-                k: v.item() if v.dim() == 0 else v.squeeze().item() 
+                k: v.item() if v.dim() == 0 else v.squeeze().item()
                 for k, v in predicted_theta.items()
             }
-        
-        # Update geo_learning with predicted theta
+
+        # Deployment: every site runs its best-known configuration (uniform rule
+        # with FedMeta). Seen sites reuse the best theta from their own training
+        # trial history; unseen sites use the cached calibration once it exists.
+        if not self.training_mode:
+            if client_id in self.deployment_theta:
+                predicted_theta_values = self.deployment_theta[client_id]
+            elif self.client_data_buffer.get(client_id):
+                buf = self.client_data_buffer[client_id]
+                finite = [b for b in buf if np.isfinite(b.get('best_loss', float('inf'))) and b.get('best_theta')]
+                pick = min(finite, key=lambda b: trial_score(b['best_loss'], b.get('metrics', {}))) if finite else buf[-1]
+                predicted_theta_values = pick['best_theta']
+                self.deployment_theta[client_id] = predicted_theta_values
+
+        # Trial 0: the meta-model's own prediction
         for k, v in predicted_theta_values.items():
             geo_learning.theta[k] = torch.tensor(v)
-
-        # Run geometric learning
         loss, metrics = self._run_geo_learning(geo_learning, processed_data, client_id)
+        best_loss, best_theta, best_metrics = loss, predicted_theta_values, metrics
+        best_score = trial_score(loss, metrics)
 
-        # Store data for meta-model training
-        self.client_data_buffer[client_id].append({
-            'scene_features': scene_features.cpu(),
-            'best_theta': predicted_theta_values,
-            'best_loss': loss,
-            'metrics': metrics
-        })
+        # Test-time calibration at a site with no local training history: the
+        # nearest-scene donor provides the initialization and the SAME
+        # weakly-supervised trial budget as FedMeta's deployment calibration,
+        # so the comparison measures initialization quality. Runs once, cached.
+        if (not self.training_mode and client_id not in self.deployment_theta
+                and not self.client_data_buffer.get(client_id)):
+            for _ in range(DEPLOYMENT_CALIBRATION_TRIALS):
+                cand = perturb_theta(predicted_theta_values)
+                for k, v in cand.items():
+                    geo_learning.theta[k] = torch.tensor(v)
+                try:
+                    c_loss, c_metrics = self._run_geo_learning(geo_learning, processed_data, client_id)
+                except Exception as e:
+                    logger.error(f"Calibration trial failed for {client_id}: {e}")
+                    continue
+                if trial_score(c_loss, c_metrics) < best_score:
+                    best_score = trial_score(c_loss, c_metrics)
+                    best_loss, best_theta, best_metrics = c_loss, cand, c_metrics
+            self.deployment_theta[client_id] = best_theta
+            logger.info(f"[Meta deploy] {client_id}: test-time calibration done (prominence {best_theta.get('peak_prominence', float('nan')):.3f})")
+
+        if self.training_mode:
+            for _ in range(2):
+                perturbed_theta = perturb_theta(predicted_theta_values)
+                for k, v in perturbed_theta.items():
+                    geo_learning.theta[k] = torch.tensor(v)
+                try:
+                    trial_loss, trial_metrics = self._run_geo_learning(geo_learning, processed_data, client_id)
+                except Exception as e:
+                    logger.error(f"Error in perturbation trial for client {client_id}: {e}")
+                    continue
+                if trial_score(trial_loss, trial_metrics) < best_score:
+                    best_score = trial_score(trial_loss, trial_metrics)
+                    best_loss, best_theta, best_metrics = trial_loss, perturbed_theta, trial_metrics
+
+            # Store data for meta-model training
+            self.client_data_buffer[client_id].append({
+                'scene_features': scene_features.cpu(),
+                'best_theta': best_theta,
+                'best_loss': best_loss,
+                'metrics': best_metrics
+            })
+
+        loss, metrics = best_loss, best_metrics
         
         # Calculate communication metrics
         duration = time.time() - start_time
@@ -176,9 +304,9 @@ class GeoLearningSystem:
         metrics.update(self._calculate_communication_metrics(
             upload_size_bytes, download_size_bytes, duration
         ))
-        
-        return loss, predicted_theta_values, metrics
-    
+
+        return loss, best_theta, metrics
+
     def _federated_client_update(self, client_id, processed_data, geo_learning):
         """Federated client update using federated learner"""
         return self.fed_learner.client_update(
@@ -219,17 +347,20 @@ class GeoLearningSystem:
             for client_id, (loss, theta, metrics) in client_results.items():
                 mlflow.log_metric(f"Baseline/Loss_{client_id}", loss, step=self.round_counter)
                 
-                # Log detailed loss components per client
-                for key in loss_component_keys:
-                    if key in metrics:
-                        mlflow.log_metric(f"Baseline/{key}_{client_id}", metrics[key], step=self.round_counter)
+                # Log detailed loss components per client (incl. model-independent raw metrics)
+                for key in loss_component_keys + ['geo_consistency_m', 'geo_coverage_m', 'geo_centerline_m',
+                                                  'geo_width_m', 'geo_total_m',
+                                                  'lane_count_err', 'lane_count_exact']:
+                    val = metrics.get(key)
+                    if val is not None and not (isinstance(val, float) and np.isnan(val)):
+                        mlflow.log_metric(f"Baseline/{key}_{client_id}", val, step=self.round_counter)
                         
         except ImportError:
             logger.warning("MLflow not available for detailed logging")
         
         return {
-            'avg_loss': np.mean([l for l in losses if l != float('inf')]),
-            'std_loss': np.std([l for l in losses if l != float('inf')]),
+            'avg_loss': (lambda fl: np.mean(fl) if fl else float('nan'))([l for l in losses if np.isfinite(l)]),
+            'std_loss': (lambda fl: np.std(fl) if fl else 0.0)([l for l in losses if np.isfinite(l)]),
             'client_count': len(client_results),
             'avg_bps': 0,
             'total_bps': 0,
@@ -258,10 +389,13 @@ class GeoLearningSystem:
                 mlflow.log_metric(f"Meta/Loss_{client_id}", loss, step=self.round_counter)
                 mlflow.log_metric(f"Meta/BPS_{client_id}", metrics.get('bps', 0), step=self.round_counter)
                 
-                # Log detailed loss components per client
-                for key in loss_component_keys:
-                    if key in metrics:
-                        mlflow.log_metric(f"Meta/{key}_{client_id}", metrics[key], step=self.round_counter)
+                # Log detailed loss components per client (incl. model-independent raw metrics)
+                for key in loss_component_keys + ['geo_consistency_m', 'geo_coverage_m', 'geo_centerline_m',
+                                                  'geo_width_m', 'geo_total_m',
+                                                  'lane_count_err', 'lane_count_exact']:
+                    val = metrics.get(key)
+                    if val is not None and not (isinstance(val, float) and np.isnan(val)):
+                        mlflow.log_metric(f"Meta/{key}_{client_id}", val, step=self.round_counter)
                 
                 # Log predicted theta parameters for meta-learning
                 if isinstance(theta, dict):
@@ -274,8 +408,8 @@ class GeoLearningSystem:
             logger.warning("MLflow not available for detailed logging")
         
         return {
-            'avg_loss': np.mean([l for l in losses if l != float('inf')]),
-            'std_loss': np.std([l for l in losses if l != float('inf')]),
+            'avg_loss': (lambda fl: np.mean(fl) if fl else float('nan'))([l for l in losses if np.isfinite(l)]),
+            'std_loss': (lambda fl: np.std(fl) if fl else 0.0)([l for l in losses if np.isfinite(l)]),
             'client_count': len(client_results),
             'avg_bps': 0,
             'total_bps': 0,
@@ -296,10 +430,14 @@ class GeoLearningSystem:
 
     def _train_meta_models(self):
         """Train individual meta-models for meta-learning strategy"""
-        selected_clients = ['US12_Todd', 'US12_Monona', 'US12_Yahara']
-        
+        selected_clients = SEEN_CLIENTS
+
         for client_id in selected_clients:
-            if len(self.client_data_buffer[client_id]) >= 10:
+            # Train from 3 buffered samples onward. The old >= 10 gate meant the
+            # per-camera models trained exactly once (at the last training epoch,
+            # 1 sample/epoch over 10 epochs) while the federated clients train
+            # every round, structurally under-training the Meta ablation.
+            if len(self.client_data_buffer[client_id]) >= 3:
                 self._train_individual_meta_model(client_id)
     
     def _train_individual_meta_model(self, client_id, num_epochs=10):
@@ -350,27 +488,32 @@ class GeoLearningSystem:
                         f"Min batch loss = {min(batch_losses):.4f}, "
                         f"Max batch loss = {max(batch_losses):.4f}")
             
+        improvement = ((epoch_losses[0] - epoch_losses[-1]) / epoch_losses[0] * 100) if epoch_losses[0] > 0 else 0.0
         logger.info(f"Meta-model training completed. "
                 f"Initial loss: {epoch_losses[0]:.4f}, "
                 f"Final loss: {epoch_losses[-1]:.4f}, "
-                f"Improvement: {((epoch_losses[0] - epoch_losses[-1]) / epoch_losses[0] * 100):.1f}%")
+                f"Improvement: {improvement:.1f}%")
     
     def select_clients(self, available_clients):
-        """Select clients based on strategy and training mode"""
-        if self.strategy == 'federated':
-            if self.training_mode:
-                return ['US12_Todd', 'US12_Monona', 'US12_Yahara']
-                # return ['US12_Todd', 'US12_Monona', 'US12_Yahara', 'US12_Stoughton', 
-                #        'US12_Whitney', 'US12_JohnNolen', 'US12_Park']
-            else:
-                return ['US12_Todd', 'US12_Monona', 'US12_Yahara', 'US12_Park']
-        elif self.strategy == 'meta':
-            if self.training_mode:
-                return ['US12_Todd', 'US12_Monona', 'US12_Yahara']
-            else:
-                return ['US12_Todd', 'US12_Monona', 'US12_Yahara', 'US12_Park']
-        else: # Baseline
-            return available_clients
+        """Select clients for the current mode.
+
+        All strategies share one seen/unseen split (SEEN_CLIENTS / UNSEEN_CLIENTS)
+        so Baseline, Meta, and FedMeta are evaluated on identical cameras. Training
+        uses the seen set; deployment adds the held-out unseen set. Only cameras that
+        also have preprocessed data this round (available_clients) are returned.
+        """
+        seen = [c for c in SEEN_CLIENTS if c in available_clients]
+        unseen = [c for c in UNSEEN_CLIENTS if c in available_clients]
+        selected = seen if self.training_mode else seen + unseen
+
+        missing = [c for c in (SEEN_CLIENTS if self.training_mode else SEEN_CLIENTS + UNSEEN_CLIENTS)
+                   if c not in available_clients]
+        if missing:
+            logger.warning(f"[{self.strategy}] split cameras with no data this round (skipped): {missing}")
+        if not selected:
+            logger.warning(f"[{self.strategy}] no split cameras available; falling back to all: {list(available_clients)}")
+            return list(available_clients)
+        return selected
     
     def switch_to_deployment(self):
         """Switch to deployment mode"""
@@ -439,9 +582,8 @@ class GeoLearningSystem:
                 
                 return loss, metrics
             else:
-                # No lanes detected
                 logger.warning(f"No lanes detected for client {client_id}")
-                return float('inf'), {'lane_count': 0, 'error': 'No lanes detected'}
+                return no_detection_result(processed_data)
             
         except Exception as e:
             logger.error(f"Error in geo_learning for client {client_id}: {e}")

@@ -9,3 +9,12 @@ results/*
 
 logs/*.log
 *.zip
+
+# internal revision working docs and manuscript source (not for public release)
+docs/revision/
+docs/Meta_geo_ORBIT_Digital_Twin/
+
+# stray nested copy of the separate geolane_encoder thesis project
+OpenDriveConversion/geolane_encoder/
+
+*.pyc

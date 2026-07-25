@@ -81,7 +81,9 @@ class GeometricLearningPipeline:
         
         # Train models
         # self.learning_system.train_models(g_epoch)
-        self.learning_system.train_models(selected_clients, local_epochs=1, lr=1e-3)
+        # local_epochs=10 gives federated clients the same per-round gradient
+        # budget as the meta strategy's per-camera training (10 epochs/round).
+        self.learning_system.train_models(selected_clients, local_epochs=10, lr=1e-3)
         
         logger.info(f"Epoch {g_epoch} - Avg Loss: {aggregated['avg_loss']:.4f} "
                    f"(±{aggregated.get('std_loss', 0):.4f}), "
@@ -203,6 +205,13 @@ def continuous_process(args, c_epoch, data_queue, stop_event, saving_path, camer
             preprocessed_by_camera = {}
 
             for camera_loc, data in data_by_camera.items():
+                # Skip cameras whose SUMO net isn't set up yet (locations listed in
+                # camera_location_list.txt but not prepared) instead of crashing the run.
+                net_file = Path(args.osm_path, camera_loc, "osm.net.xml")
+                if not net_file.exists():
+                    logger.warning(f"[Continuous Process] Skipping {camera_loc}: SUMO net not found at {net_file}")
+                    continue
+
                 # Process data for each camera
                 result = process_camera_data(
                     data_pipeline,
@@ -248,7 +257,7 @@ def geometric_learning(pipeline, g_epoch, data_queue, stop_event, barrier):
     # lane_processor = LaneAssignmentPostProcessor(pipeline.args, pipeline.saving_file_path)
     
     try:
-        for epoch in tqdm(range(g_epoch), desc="Federated Geometric Learning", position=1):
+        for epoch in tqdm(range(g_epoch), desc=f"Geometric Learning ({pipeline.learning_system.strategy})", position=1):
             barrier.wait()
             
             if stop_event.is_set():
