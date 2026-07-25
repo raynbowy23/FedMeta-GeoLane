@@ -31,6 +31,7 @@ LAYERS = [
     ("head_smoothing",   "theta_heads.smoothing_factor",   [128, 1]),
     ("head_sigma",       None,                             [128, 1]),  # not in Python — zeros
     ("head_prominence",  "theta_heads.peak_prominence",    [128, 1]),  # added post-port (see note)
+    ("head_min_evidence","theta_heads.min_lane_evidence",  [128, 1]),  # recall lever, added last
 ]
 
 LAYER_DIMS = [dims for (_, _, dims) in LAYERS]

@@ -517,6 +517,11 @@ def perturb_theta(theta_values):
             # initial prediction, so sample the range instead of a local step
             # the black-box search cannot escape.
             perturbed[k] = float(np.random.uniform(0.05, 0.95))
+        elif k == 'min_lane_evidence':
+            # Wide exploration across the absolute range (vehicles per lane): the
+            # useful gate is coupled with peak_prominence and sits far from the
+            # init, so sample the range rather than take a local step.
+            perturbed[k] = float(np.random.uniform(1, 20))
         else:
             perturbed[k] = max(0.1, min(1.0, v + noise))
     return perturbed

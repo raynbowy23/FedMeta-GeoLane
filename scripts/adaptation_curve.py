@@ -110,8 +110,8 @@ def gt_detection_error(bounds, ann_gps, match_cap_m=15.0):
 BASELINE_THETA = {
     'angle_penalty': 0.5, 'width_scale': 1.0, 'consistency_weight': 0.5,
     'triplet_margin': 0.8, 'smoothing_factor': 10.0, 'edge_trim_ratio': 0.1,
-    'peak_prominence': 0.5, 'weight_lane_count': 1.0, 'weight_consistency': 1.0,
-    'weight_triplet': 1.0, 'weight_geometry': 1.0,
+    'peak_prominence': 0.5, 'min_lane_evidence': 1.0, 'weight_lane_count': 1.0,
+    'weight_consistency': 1.0, 'weight_triplet': 1.0, 'weight_geometry': 1.0,
 }
 
 

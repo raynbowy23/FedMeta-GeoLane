@@ -97,6 +97,9 @@ class GeoLearningSystem:
             # smoothed peak, the neutral analogue of the old absolute 1.0 under
             # the normalized histogram.
             'peak_prominence': torch.tensor(0.5),
+            # Recall lever pinned off for the fixed baseline (the learned
+            # strategies adapt it); 1 = no cluster is gated, i.e. current behavior.
+            'min_lane_evidence': torch.tensor(1.0),
             'weight_lane_count': torch.tensor(1.0),
             'weight_consistency': torch.tensor(1.0),
             'weight_triplet': torch.tensor(1.0),

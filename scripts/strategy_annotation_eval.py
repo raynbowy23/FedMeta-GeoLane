@@ -26,6 +26,7 @@ sys.path.insert(0, str(ROOT))
 from adaptation_curve import (BASELINE_THETA, build_args, build_processed, evaluate,
                               load_annotation_lanes, annotation_gps, _to_m, M_LAT)
 from LaneDetection.lane_detection.geo_learning import GeometricLearning
+from LaneDetection.lane_detection.utils import trial_score
 
 SEEN = ['US12_Todd', 'US12_Monona', 'US12_Yahara',
         'US12_CountyAB', 'US12_Mineral', 'US12_University']  # Stoughton removed from split 2026-07-09
@@ -48,7 +49,12 @@ def deployed_theta(strategy, cam, fed_ckpt=FED_CKPT, meta_dir='results/meta/trai
     fin = [b for b in buf if np.isfinite(b.get('best_loss', float('inf'))) and b.get('best_theta')]
     if not fin:
         return None
-    return min(fin, key=lambda b: b['best_loss'])['best_theta']
+    # Rank by the SAME rule the pipeline deploys with (geolearning_system.py:239):
+    # trial_score = geo_total_m + LANE_COUNT_SCORE_WEIGHT_M * lane_count_err, not the
+    # weighted best_loss. best_loss omits the lane-count term and is gameable by the
+    # predicted loss weights, so it selects a different buffered round than deployment
+    # (27/36 seen buffers) and reverts the Mineral over-segmentation picker fix.
+    return min(fin, key=lambda b: trial_score(b['best_loss'], b.get('metrics', {})))['best_theta']
 
 
 def bounds_to_centerlines_m(bounds, ann_m_ref):
@@ -81,6 +87,90 @@ def prf(det_m, ann_m, tau):
     f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
     geo = float(np.mean(tp_costs)) if tp_costs else float('nan')
     return precision, recall, f1, geo, tp, len(det_m), len(ann_m)
+
+
+def _discrete_frechet(P, Q):
+    """Discrete Frechet distance between two polylines (meters). O(len(P)*len(Q))."""
+    n, m = len(P), len(Q)
+    d = np.linalg.norm(P[:, None, :] - Q[None, :, :], axis=2)
+    ca = np.empty((n, m))
+    ca[0, 0] = d[0, 0]
+    for i in range(1, n):
+        ca[i, 0] = max(ca[i - 1, 0], d[i, 0])
+    for j in range(1, m):
+        ca[0, j] = max(ca[0, j - 1], d[0, j])
+    for i in range(1, n):
+        for j in range(1, m):
+            ca[i, j] = max(min(ca[i - 1, j], ca[i - 1, j - 1], ca[i, j - 1]), d[i, j])
+    return float(ca[-1, -1])
+
+
+def _orient(D, A):
+    """Flip D so it runs the same direction as A before the order-sensitive Frechet."""
+    straight = np.linalg.norm(D[0] - A[0]) + np.linalg.norm(D[-1] - A[-1])
+    flipped = np.linalg.norm(D[0] - A[-1]) + np.linalg.norm(D[-1] - A[0])
+    return D[::-1] if flipped < straight else D
+
+
+def _crop_to(A, D):
+    """Crop annotation polyline A to the arc-length span the detected lane D covers,
+    by clipping A between the points nearest D's two endpoints. Detected centerlines
+    only span the observed region, so without this the order-sensitive Frechet and
+    the coverage distance measure the length mismatch of A instead of shape error."""
+    A = np.asarray(A, float)
+    i0 = int(np.argmin(np.linalg.norm(A - D[0], axis=1)))
+    i1 = int(np.argmin(np.linalg.norm(A - D[-1], axis=1)))
+    lo, hi = sorted((i0, i1))
+    seg = A[lo:hi + 1]
+    return seg if len(seg) >= 2 else A
+
+
+def _resample(P, n=100):
+    """Arc-length resample to n points so discrete Frechet approximates the
+    continuous one and is not inflated by mismatched vertex sampling between a
+    sparse detected centerline and a dense annotation."""
+    P = np.asarray(P, float)
+    if len(P) < 2:
+        return P
+    s = np.concatenate([[0.0], np.cumsum(np.linalg.norm(np.diff(P, axis=0), axis=1))])
+    if s[-1] == 0:
+        return np.repeat(P[:1], n, axis=0)
+    u = np.linspace(0.0, s[-1], n)
+    return np.stack([np.interp(u, s, P[:, 0]), np.interp(u, s, P[:, 1])], axis=1)
+
+
+def geometry_decomp(det_m, ann_m, tau):
+    """Geometry decomposition of detections against annotations, in meters, on the
+    SAME one-to-one Hungarian match as prf(). Returns consistency (Frechet over
+    matched pairs), centerline (mean nearest-point over matched pairs, equals
+    prf's geo_err_tp), coverage (each annotation lane to its nearest detection, the
+    recall direction that charges missed lanes), and lane-count error. Width is
+    omitted because the annotations carry centerlines only, no boundaries."""
+    out = dict(geo_consistency_m=float('nan'), geo_centerline_m=float('nan'),
+               geo_coverage_m=float('nan'),
+               lane_count_err=float(abs(len(det_m) - len(ann_m))), n_matched=0)
+    if not det_m or not ann_m:
+        return out
+    # coverage: each annotation lane to its nearest detection, measured over the
+    # extent that detection actually covers so a shorter detected span is not
+    # charged for the annotation's uncovered tail (missed lanes -> ~lane offset).
+    cov = []
+    for A in ann_m:
+        cov.append(min(det_to_ann_dist(_crop_to(A, D), D) for D in det_m))
+    out['geo_coverage_m'] = float(np.mean(cov))
+    C = np.array([[det_to_ann_dist(D, A) for A in ann_m] for D in det_m])
+    ri, ci = linear_sum_assignment(C)
+    cent, frech = [], []
+    for i, j in zip(ri, ci):
+        if C[i, j] < tau:
+            cent.append(float(C[i, j]))
+            Do = _orient(det_m[i], ann_m[j])
+            frech.append(_discrete_frechet(_resample(Do), _resample(_crop_to(ann_m[j], Do))))
+    out['n_matched'] = len(cent)
+    if cent:
+        out['geo_centerline_m'] = float(np.mean(cent))
+        out['geo_consistency_m'] = float(np.mean(frech))
+    return out
 
 
 def main():

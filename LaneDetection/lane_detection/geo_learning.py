@@ -43,6 +43,7 @@ class GeometricLearning:
             'smoothing_factor': torch.tensor(10.0),
             'sigma': torch.tensor(2.0),
             'peak_prominence': torch.tensor(0.5),
+            'min_lane_evidence': torch.tensor(1.0),  # gate off by default (neutral)
         }
 
         self.colors = [
@@ -230,6 +231,123 @@ class GeometricLearning:
         return lane_boundaries_by_id
 
 
+    @staticmethod
+    def _resample_track(P, k=20):
+        d = np.r_[0.0, np.cumsum(np.linalg.norm(np.diff(P, axis=0), axis=1))]
+        if d[-1] <= 0:
+            return None
+        t = np.linspace(0.0, d[-1], k)
+        return np.stack([np.interp(t, d, P[:, 0]), np.interp(t, d, P[:, 1])], axis=1)
+
+    @staticmethod
+    def _cluster_tracks(tracks, tau):
+        """Leader-follower incremental clustering plus k-means refinement under
+        symmetric Hausdorff distance (the trajectory-clustering detector). Returns
+        a cluster label per input track."""
+        from scipy.spatial.distance import directed_hausdorff
+
+        def hd(A, B):
+            return max(directed_hausdorff(A, B)[0], directed_hausdorff(B, A)[0])
+
+        def orient(P, ref):
+            return P if np.dot(P[-1] - P[0], ref[-1] - ref[0]) >= 0 else P[::-1]
+
+        centers, members = [], []
+        for P in tracks:
+            if not centers:
+                centers.append(P.copy()); members.append([P]); continue
+            ds = [hd(P, C) for C in centers]
+            j = int(np.argmin(ds))
+            if ds[j] < tau:
+                members[j].append(orient(P, centers[j]))
+                centers[j] = np.mean(np.stack(members[j]), axis=0)
+            else:
+                centers.append(P.copy()); members.append([P])
+        labels = np.zeros(len(tracks), dtype=int)
+        for _ in range(3):
+            buckets = [[] for _ in centers]
+            for i, P in enumerate(tracks):
+                j = int(np.argmin([hd(P, C) for C in centers]))
+                labels[i] = j
+                buckets[j].append(orient(P, centers[j]))
+            centers = [np.mean(np.stack(b), axis=0) if b else c for b, c in zip(buckets, centers)]
+        return labels, centers
+
+    def run_clustering(self, traj_df, camera_loc, tau_widths=2.0, floor_frac=0.04):
+        """Trajectory-clustering detector. Clusters vehicle tracks globally with a
+        threshold at the physical lane spacing (tau_widths x median vehicle width),
+        assigns each vehicle a lane, then reuses compute_lane_geometry to emit the
+        full anchored lane model (centerlines, widths, boundaries). Drop-in for the
+        histogram path; returns (traj_df_with_clustered_id, {0: lane_boundaries})."""
+        import polars as pl
+        from collections import Counter
+
+        pre = Path('results/preprocess', camera_loc, 'trajectory.csv')
+        df = pl.read_csv(pre)
+        tracks, ids, widths = [], [], []
+        for _, g in sorted(df.group_by('id'), key=lambda kv: kv[1]['frame_num'].min()):
+            if len(g) < 10:
+                continue
+            P = np.stack([g['x'].to_numpy(), g['y'].to_numpy()], axis=1).astype(float)
+            if np.linalg.norm(P[-1] - P[0]) < 60:
+                continue
+            R = self._resample_track(P, 20)
+            if R is not None:
+                tracks.append(R); ids.append(int(g['id'][0])); widths.append(float(np.median(g['w'].to_numpy())))
+        if len(tracks) < 5:
+            logger.warning(f"{camera_loc}: too few tracks for clustering ({len(tracks)})")
+            return traj_df.with_columns(pl.lit(-1, dtype=pl.Int64).alias('clustered_id')), {}
+        tau = tau_widths * float(np.median(widths))
+        labels, centers = self._cluster_tracks(tracks, tau)
+        cnt = Counter(labels.tolist())
+        floor = max(5, int(floor_frac * len(tracks)))
+        keep = sorted(lbl for lbl, c in cnt.items() if c >= floor)
+
+        from LaneDetection.osm_extraction.utils import trajectory_calibration
+        bounds = {}
+        new_lane = 0
+        for lbl in keep:
+            # Centerline = the cluster's mean track projected to GPS (the product
+            # that scores against annotations). Width and boundaries come from the
+            # perpendicular spread of the member vehicles about that centerline.
+            center_gps = np.asarray(trajectory_calibration(centers[lbl], self.rootpath, camera_loc)[0], float)
+            if center_gps.shape[0] < 2 or not np.isfinite(center_gps).all():
+                continue
+            lat0 = float(center_gps[:, 0].mean()); lon0 = float(center_gps[:, 1].mean())
+            m_lat = 111_320.0; m_lon = m_lat * np.cos(np.deg2rad(lat0))
+            cen_m = np.stack([(center_gps[:, 1] - lon0) * m_lon, (center_gps[:, 0] - lat0) * m_lat], axis=1)
+            axis = cen_m[-1] - cen_m[0]
+            axis = axis / (np.linalg.norm(axis) + 1e-9)
+            perp = np.array([-axis[1], axis[0]])
+            offs = []
+            for i, l in enumerate(labels):
+                if l != lbl:
+                    continue
+                g = np.asarray(trajectory_calibration(tracks[i], self.rootpath, camera_loc)[0], float)
+                pm = np.stack([(g[:, 1] - lon0) * m_lon, (g[:, 0] - lat0) * m_lat], axis=1)
+                offs.append(((pm - cen_m.mean(0)) @ perp))
+            spread = np.concatenate(offs) if offs else np.array([0.0])
+            width = float(np.clip(np.percentile(spread, 90) - np.percentile(spread, 10), 2.5, 4.5))
+            # perp is a unit vector in local meters [east, north]; convert a
+            # half-width offset back to a [lat, lon] delta for the boundaries.
+            off_gps = np.array([(width / 2.0) * perp[1] / m_lat, (width / 2.0) * perp[0] / m_lon])
+            bounds[new_lane] = {
+                'center': center_gps,
+                'left': center_gps + off_gps,
+                'right': center_gps - off_gps,
+                'width': width,
+            }
+            new_lane += 1
+        logger.info(f"{camera_loc}: clustering detector found {len(bounds)} lanes")
+        # tag traj_df for downstream consumers that expect clustered_id
+        remap = {lbl: i for i, lbl in enumerate(keep)}
+        lane_df = pl.DataFrame({'id': [vid for vid, l in zip(ids, labels) if l in remap],
+                                'clustered_id': [remap[int(l)] for l in labels if l in remap]})
+        traj_df = traj_df.join(lane_df, on='id', how='left').with_columns(
+            pl.col('clustered_id').fill_null(-1).cast(pl.Int64)) if lane_df.height else \
+            traj_df.with_columns(pl.lit(-1, dtype=pl.Int64).alias('clustered_id'))
+        return traj_df, {0: bounds}
+
     def run(self, c_epoch, g_epoch, traj_df,
             camera_loc, trial, is_save):
         """
@@ -366,9 +484,33 @@ class GeometricLearning:
 
             if lane_num_list[c] != 0:
                 kmeans = KMeans(n_clusters=lane_num_list[c], random_state=0).fit(X)
+                labels = kmeans.labels_.astype(int)
+
+                # Absolute min-evidence gate (learned recall lever). Drop any
+                # cluster with fewer than min_lane_evidence supporting vehicles,
+                # then renumber the survivors contiguously so a low peak_prominence
+                # can recover weak lanes while spurious low-support peaks are
+                # rejected. The gate is in absolute counts (scene-dependent
+                # optimum), unlike the normalized peak_prominence. Default 1 = off.
+                min_ev = self.theta.get('min_lane_evidence', 1)
+                if isinstance(min_ev, torch.Tensor):
+                    min_ev = min_ev.item()
+                min_ev = max(1, int(round(float(min_ev))))
+                counts = np.bincount(labels, minlength=lane_num_list[c])
+                keep = [lbl for lbl in range(len(counts)) if counts[lbl] >= min_ev]
+                if not keep:
+                    lane_num_list[c] = 0
+                    logger.info(f"contour {cnts}: all {len(counts)} clusters below "
+                                f"min_lane_evidence={min_ev}, 0 lanes")
+                    continue
+                if len(keep) < len(counts):
+                    remap = {old: new for new, old in enumerate(keep)}
+                    labels = np.array([remap.get(l, -1) for l in labels])
+                    lane_num_list[c] = len(keep)
+
                 trajectory_summary = trajectory_summary.with_columns([
-                    pl.lit(kmeans.labels_).cast(pl.Int64).alias("clustered_id")
-                ])
+                    pl.lit(labels).cast(pl.Int64).alias("clustered_id")
+                ]).filter(pl.col("clustered_id") >= 0)
                 cluster_assignments.append(trajectory_summary.select(["id", "clustered_id"]))
 
                 df_labeled = df_contour.join(

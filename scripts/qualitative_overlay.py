@@ -29,9 +29,9 @@ from LaneDetection.lane_detection.utils import SceneFeatureExtractor
 from LaneDetection.lane_detection.geo_learning import GeometricLearning
 from LaneDetection.osm_extraction.utils import trajectory_calibration
 
-METHODS = [('baseline', 'Fixed baseline', (0.75, 0.75, 0.75)),
+METHODS = [('baseline', 'Fixed baseline', (0.17, 0.63, 0.17)),
            ('meta', 'Meta (per-camera)', (0.12, 0.47, 0.71)),
-           ('fed_perfedavg', 'FedMeta', (1.00, 0.50, 0.05)),
+           ('fed_fedavg', 'FedMeta', (1.00, 0.50, 0.05)),
            ('qiu', 'Qiu et al. [28]', (0.58, 0.40, 0.74)),
            ('ren', 'Ren core [29]', (0.84, 0.15, 0.16))]
 
@@ -59,6 +59,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--qiu_path', default=None)
     ap.add_argument('--cameras', nargs='+', default=SEEN + UNSEEN)
+    ap.add_argument('--panels', action='store_true',
+                    help='also export each panel as a separate label-free PNG at native frame resolution (results/qualitative/panels/)')
     opts = ap.parse_args()
     args = build_args()
     sfp = Path(args.saving_path, 'federated')
@@ -78,7 +80,7 @@ def main():
         to_px = gps_to_pixel_fn(cam, ann_px, args.dataset_path)
 
         lanes_px = {}
-        for cfg in ['baseline', 'meta', 'fed_perfedavg']:
+        for cfg in ['baseline', 'meta', 'fed_fedavg']:
             try:
                 theta = config_theta(cfg, 42, cam, split, feats)
                 _, _, bounds = evaluate(geo, processed, cam, theta)
@@ -123,7 +125,7 @@ def main():
         for ax, (key, label, color) in zip(axes, panels):
             ax.imshow(frame)
             for A in ann_px:
-                ax.plot(A[:, 0], A[:, 1], '--', color='white', lw=1.4, alpha=0.9)
+                ax.plot(A[:, 0], A[:, 1], '-', color='black', lw=1.6, alpha=0.9)
             if key != 'annotations':
                 def clip(P):
                     P = np.asarray(P, float)
@@ -146,13 +148,45 @@ def main():
                 cap = 'center+boundaries' if nb else 'centerline only'
                 ax.set_title(f'{label} ({len(lanes_px.get(key, []))} lanes, {cap})')
             else:
-                ax.set_title(f'{cam} ({split}) — human annotations (white dashed)')
+                ax.set_title(f'{cam} ({split}) — human annotations (black solid)')
             ax.set_xlim(0, W); ax.set_ylim(H, 0); ax.axis('off')
         fig.suptitle(f'Detected lanes over the camera view — {cam}', y=0.99)
         fig.tight_layout()
         fig.savefig(out_dir / f'{cam}_overlay.png', dpi=140)
         plt.close(fig)
         print(f'{cam}: wrote results/qualitative/{cam}_overlay.png')
+
+        if opts.panels:
+            # label-free single panels at native resolution for manuscript
+            # composition: raw frame, annotations-only, and one per method
+            pdir = out_dir / 'panels'; pdir.mkdir(exist_ok=True)
+            def save_panel(name, draw):
+                pfig = plt.figure(figsize=(W / 100.0, H / 100.0), dpi=100)
+                pax = pfig.add_axes([0, 0, 1, 1])
+                pax.imshow(frame)
+                draw(pax)
+                pax.set_xlim(0, W); pax.set_ylim(H, 0); pax.axis('off')
+                pfig.savefig(pdir / f'{cam}_{name}.png', dpi=100)
+                plt.close(pfig)
+            def draw_ann(pax):
+                for A in ann_px:
+                    pax.plot(A[:, 0], A[:, 1], '-', color='black', lw=2.0, alpha=0.9)
+            save_panel('frame', lambda pax: None)
+            save_panel('annotations', draw_ann)
+            for key, label, color in methods:
+                def draw_m(pax, key=key, color=color):
+                    draw_ann(pax)
+                    for L in lanes_px.get(key, []):
+                        C = clip(L['center'])
+                        if len(C) >= 2:
+                            pax.plot(C[:, 0], C[:, 1], color=color, lw=3.0, alpha=0.95)
+                        for side in ('left', 'right'):
+                            if side in L and L[side] is not None and len(L[side]) >= 2:
+                                B = clip(L[side])
+                                if len(B) >= 2:
+                                    pax.plot(B[:, 0], B[:, 1], color=color, lw=1.5, alpha=0.75)
+                save_panel(key, draw_m)
+            print(f'{cam}: wrote {2 + len(methods)} label-free panels to results/qualitative/panels/')
 
 
 if __name__ == '__main__':

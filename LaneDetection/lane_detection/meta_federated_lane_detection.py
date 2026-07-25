@@ -68,7 +68,7 @@ class MetaMLModel(nn.Module):
     Black-box meta-learner that maps scene features to optimal theta parameters.
     No gradient-based adaptation - directly predicts parameters from features.
     """
-    def __init__(self, feature_dim=SCENE_FEATURE_DIM, hidden_dim=128, num_theta_params=5, config_path=None):
+    def __init__(self, feature_dim=SCENE_FEATURE_DIM, hidden_dim=128, num_theta_params=6, config_path=None):
         super(MetaMLModel, self).__init__()
         
         self.config = FederatedConfig(config_path)
@@ -92,6 +92,13 @@ class MetaMLModel(nn.Module):
             'triplet_margin': nn.Linear(hidden_dim, 1),
             'smoothing_factor': nn.Linear(hidden_dim, 1),
             'peak_prominence': nn.Linear(hidden_dim, 1),
+            # Absolute recall lever, added LAST to keep saved-checkpoint layer
+            # order stable for the Rust export. Unlike peak_prominence (a
+            # normalized fraction that collapses to a scene-independent
+            # constant), the minimum vehicles-per-lane gate is in absolute
+            # counts, so its optimum stays scene-dependent and gives the
+            # meta-learner something to actually adapt.
+            'min_lane_evidence': nn.Linear(hidden_dim, 1),
         })
 
         # Learnable loss weights
@@ -149,6 +156,11 @@ class MetaMLModel(nn.Module):
                 # across sparse and busy scenes. Lower recovers weak lanes,
                 # higher rejects spurious peaks.
                 theta_dict[param_name] = torch.sigmoid(head(features)).squeeze() * 0.9 + 0.05
+            elif param_name == 'min_lane_evidence':
+                # Absolute minimum vehicles per lane, 1-20. A cluster with fewer
+                # supporting vehicles is dropped, so a low peak_prominence can
+                # recover weak lanes without admitting spurious low-support peaks.
+                theta_dict[param_name] = torch.sigmoid(head(features)).squeeze() * 19 + 1
             else:
                 # Others typically 0-1
                 theta_dict[param_name] = torch.sigmoid(head(features)).squeeze()
